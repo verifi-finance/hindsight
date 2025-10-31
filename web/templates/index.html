@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Memory Graph - Live Visualization</title>
+    <meta charset="utf-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="tab-container">
+        <div class="tab-buttons">
+            <button class="tab-button active" onclick="switchTab('graph')">Graph View</button>
+            <button class="tab-button" onclick="switchTab('table')">Table View</button>
+            <button class="tab-button" onclick="switchTab('debug')">Search Debug</button>
+            <button class="tab-button" onclick="switchTab('locomo')">Locomo Benchmark</button>
+        </div>
+
+        <div id="graph-tab" class="tab-content active">
+            <div style="padding: 15px; background: #f9f9f9; border-bottom: 2px solid #333;">
+                <div style="display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+                    <button onclick="loadGraphData()" style="padding: 8px 20px; background: #66bb6a; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px;">
+                        📊 Load Graph Data
+                    </button>
+                    <div>
+                        <label style="font-weight: bold; margin-right: 5px;">Limit nodes:</label>
+                        <input type="number" id="node-limit" value="50" min="10" max="1000" step="10"
+                               style="width: 80px; padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+                    </div>
+                    <div>
+                        <label style="font-weight: bold; margin-right: 5px;">Layout:</label>
+                        <select id="layout-select" style="padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+                            <option value="circle">Circle (fast)</option>
+                            <option value="grid">Grid (fast)</option>
+                            <option value="cose">Force-directed (slow)</option>
+                        </select>
+                    </div>
+                    <button onclick="reloadGraph()" style="padding: 6px 15px; background: #42a5f5; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
+                        Apply
+                    </button>
+                    <button onclick="loadGraphData()" class="refresh-button">
+                        🔄 Refresh
+                    </button>
+                    <span id="node-count" style="color: #666; font-size: 14px;"></span>
+                </div>
+            </div>
+            <div id="cy"><div style="padding: 40px; text-align: center; color: #666;">
+                <p>Click "Load Graph Data" to visualize the memory graph</p>
+            </div></div>
+            <div class="legend">
+                <h3>Legend</h3>
+                <h4 style="margin: 10px 0 5px 0;">Link Types:</h4>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #00bcd4; border-top: 1px dashed #00bcd4;"></div>
+                    <span><b>Temporal</b></span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #ff69b4;"></div>
+                    <span><b>Semantic</b></span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-line" style="background: #ffd700;"></div>
+                    <span><b>Entity</b></span>
+                </div>
+                <h4 style="margin: 15px 0 5px 0;">Nodes:</h4>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #e0e0e0;"></div>
+                    <span>No entities</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #90caf9;"></div>
+                    <span>1 entity</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-node" style="background: #42a5f5;"></div>
+                    <span>2+ entities</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="table-tab" class="tab-content">
+            <h2>Memory Units <span id="table-count"></span></h2>
+            <div style="margin-bottom: 15px;">
+                <button onclick="loadGraphData()" style="padding: 8px 20px; background: #66bb6a; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px;">
+                    📊 Load Table Data
+                </button>
+            </div>
+            <input type="text" id="table-filter" placeholder="Filter by text, context, or entities...">
+            <div style="overflow-x: auto;">
+                <table id="memory-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Text</th>
+                            <th>Context</th>
+                            <th>Date</th>
+                            <th>Entities</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                        <tr><td colspan="5" style="padding: 40px; text-align: center; color: #666;">Click "Load Table Data" to view memory units</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="debug-tab" class="tab-content">
+            <h2>Search Debug</h2>
+            <div style="margin-bottom: 15px;">
+                <button class="debug-button secondary" onclick="addDebugPane()">+ Add Search Pane</button>
+            </div>
+            <div id="debug-panes-container" class="debug-container">
+                <!-- Debug panes will be added here dynamically -->
+            </div>
+        </div>
+
+        <div id="locomo-tab" class="tab-content">
+            <h2>Locomo Benchmark Results</h2>
+            <p style="color: #666; margin-bottom: 15px;">
+                Analyze benchmark results and debug incorrect answers.
+            </p>
+            <div style="margin-bottom: 15px;">
+                <button onclick="loadLocomoResults()" style="padding: 8px 20px; background: #66bb6a; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px;">
+                    📊 Load Benchmark Results
+                </button>
+            </div>
+            <div id="locomo-content">
+                <p style="padding: 20px; text-align: center; color: #666;">Click "Load Benchmark Results" to view the data</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+    <script src="/static/js/locomo.js"></script>
+</body>
+</html>

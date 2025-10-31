@@ -110,6 +110,53 @@ class TemporalSemanticMemory:
         self.embedding_model = SentenceTransformer(embedding_model)
         print(f"✓ Model loaded (embedding dim: {self.embedding_model.get_sentence_embedding_dimension()})")
 
+        # Background queue for access count updates (to avoid blocking searches)
+        self._access_count_queue = asyncio.Queue()
+        self._access_count_worker_task = None
+        self._shutdown_event = asyncio.Event()
+
+    async def _access_count_worker(self):
+        """Background worker that processes access count updates in batches."""
+        pool = self._pool  # Pool is guaranteed to exist when worker starts
+
+        while not self._shutdown_event.is_set():
+            try:
+                # Collect updates for up to 1 second or 1000 items
+                updates = {}
+                deadline = asyncio.get_event_loop().time() + 1.0
+
+                while len(updates) < 1000 and asyncio.get_event_loop().time() < deadline:
+                    try:
+                        # Wait for items with short timeout
+                        remaining_time = max(0.1, deadline - asyncio.get_event_loop().time())
+                        node_ids = await asyncio.wait_for(
+                            self._access_count_queue.get(),
+                            timeout=remaining_time
+                        )
+                        # Deduplicate by adding to set
+                        for node_id in node_ids:
+                            updates[node_id] = True
+                    except asyncio.TimeoutError:
+                        break
+
+                # Process batch if we have updates
+                if updates:
+                    node_id_list = list(updates.keys())
+                    try:
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE memory_units SET access_count = access_count + 1 WHERE id::text = ANY($1)",
+                                node_id_list
+                            )
+                    except Exception as e:
+                        print(f"[ACCESS_COUNT_WORKER] Error updating access counts: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[ACCESS_COUNT_WORKER] Unexpected error: {e}")
+                await asyncio.sleep(1)  # Backoff on error
+
     async def _get_pool(self) -> asyncpg.Pool:
         """Get or create the connection pool (lazy initialization)."""
         if self._pool is None:
@@ -125,10 +172,27 @@ class TemporalSemanticMemory:
                     # Initialize entity resolver with pool
                     if self.entity_resolver is None:
                         self.entity_resolver = EntityResolver(self._pool)
+
+        # Start access count worker (outside lock, after pool is created)
+        if self._access_count_worker_task is None and self._pool is not None:
+            self._access_count_worker_task = asyncio.create_task(self._access_count_worker())
+
         return self._pool
 
     async def close(self):
-        """Close the connection pool."""
+        """Close the connection pool and shutdown background workers."""
+        # Signal shutdown to worker
+        self._shutdown_event.set()
+
+        # Cancel and wait for worker task
+        if self._access_count_worker_task is not None:
+            self._access_count_worker_task.cancel()
+            try:
+                await self._access_count_worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # Close pool
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
@@ -494,8 +558,12 @@ class TemporalSemanticMemory:
         query: str,
         thinking_budget: int = 50,
         top_k: int = 10,
-        live_tracer=None,
-    ) -> List[Dict[str, Any]]:
+        enable_trace: bool = False,
+        weight_activation: float = 0.30,
+        weight_semantic: float = 0.30,
+        weight_recency: float = 0.25,
+        weight_frequency: float = 0.15,
+    ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """
         Search memories using spreading activation (synchronous wrapper).
 
@@ -507,13 +575,20 @@ class TemporalSemanticMemory:
             query: Search query
             thinking_budget: How many units to explore (computational budget)
             top_k: Number of results to return
-            live_tracer: Optional LiveSearchTracer for visualization
+            enable_trace: If True, returns detailed SearchTrace object
+            weight_activation: Weight for activation component (default: 0.30)
+            weight_semantic: Weight for semantic similarity component (default: 0.30)
+            weight_recency: Weight for recency component (default: 0.25)
+            weight_frequency: Weight for frequency component (default: 0.15)
 
         Returns:
-            List of memory units with their weights, sorted by relevance
+            Tuple of (results, trace)
         """
         # Run async version synchronously
-        return asyncio.run(self.search_async(agent_id, query, thinking_budget, top_k, live_tracer))
+        return asyncio.run(self.search_async(
+            agent_id, query, thinking_budget, top_k, enable_trace,
+            weight_activation, weight_semantic, weight_recency, weight_frequency
+        ))
 
     async def search_async(
         self,
@@ -521,8 +596,12 @@ class TemporalSemanticMemory:
         query: str,
         thinking_budget: int = 50,
         top_k: int = 10,
-        live_tracer=None,
-    ) -> List[Dict[str, Any]]:
+        enable_trace: bool = False,
+        weight_activation: float = 0.30,
+        weight_semantic: float = 0.30,
+        weight_recency: float = 0.25,
+        weight_frequency: float = 0.15,
+    ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """
         Search memories using spreading activation (ASYNC version).
 
@@ -542,24 +621,41 @@ class TemporalSemanticMemory:
         Returns:
             List of memory units with their weights, sorted by relevance
         """
+        # Initialize tracer if requested
+        from .search_tracer import SearchTracer
+        tracer = SearchTracer(query, thinking_budget, top_k) if enable_trace else None
+        if tracer:
+            tracer.start()
+
         pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            search_start = time.time()
-            print(f"\n[SEARCH] Starting search for query: '{query[:50]}...' (thinking_budget={thinking_budget}, top_k={top_k})")
+        search_start = time.time()
+        print(f"\n[SEARCH] Starting search for query: '{query[:50]}...' (thinking_budget={thinking_budget}, top_k={top_k})")
 
-            try:
-                # Step 1: Generate query embedding
-                step_start = time.time()
-                query_embedding = self._generate_embedding(query)
-                print(f"  [1] Generate query embedding: {time.time() - step_start:.3f}s")
+        try:
+            # Step 1: Generate query embedding (CPU-bound, no DB needed)
+            step_start = time.time()
+            query_embedding = self._generate_embedding(query)
+            step_duration = time.time() - step_start
+            print(f"  [1] Generate query embedding: {step_duration:.3f}s")
 
-                # Step 2: Find entry points
-                step_start = time.time()
-                # Convert embedding to string for asyncpg
-                query_embedding_str = str(query_embedding)
+            if tracer:
+                tracer.record_query_embedding(query_embedding)
+                tracer.add_phase_metric("generate_query_embedding", step_duration)
+
+            # Step 2: Find entry points (acquire connection only for this query)
+            step_start = time.time()
+            query_embedding_str = str(query_embedding)
+
+            # Log connection acquisition
+            conn_acquire_start = time.time()
+            async with pool.acquire() as conn:
+                conn_acquire_time = time.time() - conn_acquire_start
+                if conn_acquire_time > 0.1:  # Log if waiting > 100ms
+                    print(f"      [2.1] Waited {conn_acquire_time:.3f}s for connection (pool busy)")
+
                 entry_points = await conn.fetch(
                     """
-                    SELECT id, text, context, event_date, access_count,
+                    SELECT id, text, context, event_date, access_count, embedding,
                            1 - (embedding <=> $1::vector) AS similarity
                     FROM memory_units
                     WHERE agent_id = $2
@@ -571,59 +667,82 @@ class TemporalSemanticMemory:
                     query_embedding_str, agent_id
                 )
 
-                print(f"  [2] Find entry points: {len(entry_points)} found in {time.time() - step_start:.3f}s")
+            step_duration = time.time() - step_start
+            print(f"  [2] Find entry points: {len(entry_points)} found in {step_duration:.3f}s")
 
-                if not entry_points:
-                    print(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
-                    return []
-
-                # Step 3: Spreading activation with budget
-                step_start = time.time()
-                visited = set()
-                results = []
-                budget_remaining = thinking_budget
-                # Initialize entry points with their actual similarity scores instead of 1.0
-                queue = [(dict(unit), unit["similarity"], True) for unit in entry_points]  # (unit, activation, is_entry)
-
-                # Track substep timings
-                update_access_time = 0
-                calculate_weight_time = 0
-                query_neighbors_time = 0
-                process_neighbors_time = 0
-
-                # Process nodes in batches for efficient neighbor querying
-                BATCH_SIZE = 50
-                nodes_to_process = []  # (unit, activation, is_entry_point)
-
-                while queue and budget_remaining > 0:
-                    # Collect a batch of nodes to process
-                    while queue and len(nodes_to_process) < BATCH_SIZE and budget_remaining > 0:
-                        current_unit, activation, is_entry_point = queue.pop(0)
-                        unit_id = str(current_unit["id"])
-
-                        if unit_id not in visited:
-                            visited.add(unit_id)
-                            budget_remaining -= 1
-                            nodes_to_process.append((current_unit, activation, is_entry_point))
-
-                    if not nodes_to_process:
-                        break
-
-                    # Update access counts for batch
-                    substep_start = time.time()
-                    node_ids = [str(node[0]["id"]) for node in nodes_to_process]
-                    await conn.execute(
-                        "UPDATE memory_units SET access_count = access_count + 1 WHERE id::text = ANY($1)",
-                        node_ids
+            if tracer:
+                tracer.add_phase_metric("find_entry_points", step_duration, {"count": len(entry_points)})
+                for rank, ep in enumerate(entry_points, 1):
+                    tracer.add_entry_point(
+                        node_id=str(ep["id"]),
+                        text=ep["text"],
+                        similarity=ep["similarity"],
+                        rank=rank
                     )
-                    update_access_time += time.time() - substep_start
 
-                    # Query neighbors for ALL nodes in batch at once
+            if not entry_points:
+                print(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
+                if tracer:
+                    trace = tracer.finalize([])
+                    return [], trace
+                return [], None
+
+            # Step 3: Spreading activation with budget (in-memory processing)
+            step_start = time.time()
+            visited = set()
+            results = []
+            budget_remaining = thinking_budget
+            # Initialize entry points with their actual similarity scores instead of 1.0
+            # Format: (unit, activation, is_entry, parent_node_id, link_type, link_weight)
+            queue = [(dict(unit), unit["similarity"], True, None, None, None) for unit in entry_points]
+
+            # Track substep timings
+            calculate_weight_time = 0
+            query_neighbors_time = 0
+            process_neighbors_time = 0
+
+            # Track which nodes were visited for deferred access count update
+            visited_node_ids = []
+
+            # Process nodes in batches for efficient neighbor querying
+            BATCH_SIZE = 50
+            nodes_to_process = []  # (unit, activation, is_entry_point, parent_node_id, link_type, link_weight)
+
+            while queue and budget_remaining > 0:
+                # Collect a batch of nodes to process (in-memory, no DB)
+                while queue and len(nodes_to_process) < BATCH_SIZE and budget_remaining > 0:
+                    current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight = queue.pop(0)
+                    unit_id = str(current_unit["id"])
+
+                    if unit_id not in visited:
+                        visited.add(unit_id)
+                        budget_remaining -= 1
+                        nodes_to_process.append((current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight))
+                        visited_node_ids.append(unit_id)  # Track for deferred update
+                    elif tracer:
+                        # Node already visited - prune
+                        tracer.prune_node(unit_id, "already_visited", activation)
+
+                if not nodes_to_process:
+                    break
+
+                # Acquire connection ONLY for neighbor queries (defer access count updates)
+                node_ids = [str(node[0]["id"]) for node in nodes_to_process]
+
+                # Log connection acquisition for batch queries
+                batch_conn_start = time.time()
+                async with pool.acquire() as conn:
+                    batch_conn_acquire = time.time() - batch_conn_start
+                    if batch_conn_acquire > 0.1:  # Log if waiting > 100ms
+                        print(f"      [3.3.1] Waited {batch_conn_acquire:.3f}s for connection (pool busy) - batch size: {len(node_ids)}")
+
+                    # Query neighbors for ALL nodes in batch at once (without embeddings for speed)
                     substep_start = time.time()
                     all_neighbors = await conn.fetch(
                         """
-                        SELECT ml.from_unit_id, ml.to_unit_id, ml.weight,
-                               mu.text, mu.context, mu.event_date, mu.access_count
+                        SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
+                               mu.text, mu.context, mu.event_date, mu.access_count,
+                               mu.id as neighbor_id
                         FROM memory_links ml
                         JOIN memory_units mu ON ml.to_unit_id = mu.id
                         WHERE ml.from_unit_id::text = ANY($1)
@@ -632,116 +751,190 @@ class TemporalSemanticMemory:
                         """,
                         node_ids
                     )
-                    query_neighbors_time += time.time() - substep_start
+                    neighbor_query_time = time.time() - substep_start
+                    if neighbor_query_time > 1.0:  # Log slow neighbor queries
+                        print(f"      [3.3.3] Slow NEIGHBOR query: {neighbor_query_time:.3f}s for {len(node_ids)} nodes → {len(all_neighbors)} neighbors")
+                    query_neighbors_time += neighbor_query_time
 
-                    # Group neighbors by from_unit_id
+                    # Fetch embeddings for current batch nodes (needed for weight calculation)
                     substep_start = time.time()
-                    neighbors_by_node = {}
-                    for neighbor in all_neighbors:
-                        from_id = str(neighbor["from_unit_id"])
-                        if from_id not in neighbors_by_node:
-                            neighbors_by_node[from_id] = []
-                        neighbors_by_node[from_id].append(neighbor)
+                    embeddings = await conn.fetch(
+                        "SELECT id, embedding FROM memory_units WHERE id::text = ANY($1)",
+                        node_ids
+                    )
+                    embedding_map = {str(row["id"]): row["embedding"] for row in embeddings}
+                    fetch_embeddings_time = time.time() - substep_start
+                    if fetch_embeddings_time > 0.5:
+                        print(f"      [3.3.4] Slow EMBEDDING fetch: {fetch_embeddings_time:.3f}s for {len(node_ids)} nodes")
+                    query_neighbors_time += fetch_embeddings_time
 
-                    # Process each node in the batch
-                    for current_unit, activation, is_entry_point in nodes_to_process:
-                        unit_id = str(current_unit["id"])
+                # Group neighbors by from_unit_id (in-memory, no DB)
+                substep_start = time.time()
+                neighbors_by_node = {}
+                for neighbor in all_neighbors:
+                    from_id = str(neighbor["from_unit_id"])
+                    if from_id not in neighbors_by_node:
+                        neighbors_by_node[from_id] = []
+                    neighbors_by_node[from_id].append(neighbor)
 
-                        # Calculate combined weight
-                        event_date = current_unit["event_date"]
-                        days_since = (utcnow() - event_date).total_seconds() / 86400
+                # Process each node in the batch (CPU-bound, no DB)
+                for current_unit, activation, is_entry_point, parent_node_id, parent_link_type, parent_link_weight in nodes_to_process:
+                    unit_id = str(current_unit["id"])
 
-                        recency_weight = calculate_recency_weight(days_since)
-                        frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
+                    # Calculate combined weight
+                    event_date = current_unit["event_date"]
+                    days_since = (utcnow() - event_date).total_seconds() / 86400
 
-                        # Normalize frequency to [0, 1] range
-                        frequency_normalized = (frequency_weight - 1.0) / 1.0
+                    recency_weight = calculate_recency_weight(days_since)
+                    frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
 
-                        # Calculate semantic similarity between query and this memory
-                        memory_embedding = current_unit.get("embedding")
-                        if memory_embedding is not None:
-                            # Cosine similarity = 1 - cosine distance
-                            query_vec = np.array(query_embedding)
-                            memory_vec = np.array(memory_embedding)
-                            # Cosine similarity
-                            dot_product = np.dot(query_vec, memory_vec)
-                            norm_query = np.linalg.norm(query_vec)
-                            norm_memory = np.linalg.norm(memory_vec)
-                            semantic_similarity = dot_product / (norm_query * norm_memory) if norm_query > 0 and norm_memory > 0 else 0.0
-                        else:
-                            semantic_similarity = 0.0
+                    # Normalize frequency to [0, 1] range
+                    frequency_normalized = (frequency_weight - 1.0) / 1.0
 
-                        # Combined weight: 30% activation, 30% semantic similarity, 25% recency, 15% frequency
-                        final_weight = 0.3 * activation + 0.3 * semantic_similarity + 0.25 * recency_weight + 0.15 * frequency_normalized
+                    # Calculate semantic similarity between query and this memory
+                    # Get embedding from the map we fetched
+                    memory_embedding = embedding_map.get(unit_id)
+                    if memory_embedding is not None:
+                        # Convert embedding to list of floats if it's a string or other type
+                        if isinstance(memory_embedding, str):
+                            import json
+                            memory_embedding = json.loads(memory_embedding)
+                        elif not isinstance(memory_embedding, (list, np.ndarray)):
+                            # If it's some other type, try to convert it
+                            memory_embedding = list(memory_embedding)
 
-                        # Notify tracer
-                        if live_tracer:
-                            live_tracer.visit_node(
-                                node_id=unit_id,
-                                text=current_unit["text"],
-                                activation=activation,
-                                recency=recency_weight,
-                                frequency=frequency_weight,
-                                weight=final_weight,
-                                is_entry_point=is_entry_point,
-                            )
+                        # Cosine similarity = 1 - cosine distance
+                        query_vec = np.array(query_embedding, dtype=np.float64)
+                        memory_vec = np.array(memory_embedding, dtype=np.float64)
+                        # Cosine similarity
+                        dot_product = np.dot(query_vec, memory_vec)
+                        norm_query = np.linalg.norm(query_vec)
+                        norm_memory = np.linalg.norm(memory_vec)
+                        semantic_similarity = dot_product / (norm_query * norm_memory) if norm_query > 0 and norm_memory > 0 else 0.0
+                    else:
+                        semantic_similarity = 0.0
 
-                        results.append({
-                            "id": unit_id,
-                            "text": current_unit["text"],
-                            "context": current_unit.get("context", ""),
-                            "event_date": event_date.isoformat(),
-                            "weight": final_weight,
-                            "activation": activation,
-                            "semantic_similarity": semantic_similarity,
-                            "recency": recency_weight,
-                            "frequency": frequency_weight,
-                        })
+                    # Combined weight using configurable parameters
+                    final_weight = (
+                        weight_activation * activation +
+                        weight_semantic * semantic_similarity +
+                        weight_recency * recency_weight +
+                        weight_frequency * frequency_normalized
+                    )
 
-                        # Spread to neighbors (from batch query results)
-                        neighbors = neighbors_by_node.get(unit_id, [])
-                        for neighbor in neighbors:
-                            neighbor_id = str(neighbor["to_unit_id"])
-                            if neighbor_id not in visited:
-                                link_weight = neighbor["weight"]
-                                new_activation = activation * link_weight * 0.8  # 0.8 = decay factor
+                    # Notify tracer
+                    if tracer:
+                        tracer.visit_node(
+                            node_id=unit_id,
+                            text=current_unit["text"],
+                            context=current_unit.get("context", ""),
+                            event_date=event_date,
+                            access_count=current_unit.get("access_count", 0),
+                            is_entry_point=is_entry_point,
+                            parent_node_id=parent_node_id,
+                            link_type=parent_link_type,
+                            link_weight=parent_link_weight,
+                            activation=activation,
+                            semantic_similarity=semantic_similarity,
+                            recency=recency_weight,
+                            frequency=frequency_normalized,
+                            final_weight=final_weight,
+                        )
 
-                                if new_activation > 0.1:
-                                    queue.append(({
-                                        "id": neighbor["to_unit_id"],
-                                        "text": neighbor["text"],
-                                        "context": neighbor.get("context", ""),
-                                        "event_date": neighbor["event_date"],
-                                        "access_count": neighbor["access_count"],
-                                        "embedding": neighbor.get("embedding"),
-                                    }, new_activation, False))  # Not an entry point
+                    results.append({
+                        "id": unit_id,
+                        "text": current_unit["text"],
+                        "context": current_unit.get("context", ""),
+                        "event_date": event_date.isoformat(),
+                        "weight": final_weight,
+                        "activation": activation,
+                        "semantic_similarity": semantic_similarity,
+                        "recency": recency_weight,
+                        "frequency": frequency_weight,
+                    })
 
-                    calculate_weight_time += time.time() - substep_start
-                    process_neighbors_time += time.time() - substep_start
+                    # Spread to neighbors (from batch query results)
+                    neighbors = neighbors_by_node.get(unit_id, [])
+                    for neighbor in neighbors:
+                        neighbor_id = str(neighbor["to_unit_id"])
+                        link_weight = neighbor["weight"]
+                        link_type = neighbor["link_type"]
+                        entity_id = str(neighbor["entity_id"]) if neighbor["entity_id"] else None
+                        new_activation = activation * link_weight * 0.8  # 0.8 = decay factor
 
-                    # Clear batch for next iteration
-                    nodes_to_process = []
+                        if neighbor_id not in visited:
+                            if new_activation > 0.1:
+                                queue.append(({
+                                    "id": neighbor["to_unit_id"],
+                                    "text": neighbor["text"],
+                                    "context": neighbor.get("context", ""),
+                                    "event_date": neighbor["event_date"],
+                                    "access_count": neighbor["access_count"],
+                                }, new_activation, False, unit_id, link_type, link_weight))  # parent_id, link_type, link_weight
 
-                    spreading_activation_time = time.time() - step_start
-                    num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
-                    print(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
-                    print(f"      [3.1] Update access counts: {update_access_time:.3f}s")
-                    print(f"      [3.2] Calculate weights: {calculate_weight_time:.3f}s")
-                    print(f"      [3.3] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
-                    print(f"      [3.4] Process neighbors: {process_neighbors_time:.3f}s")
+                                if tracer:
+                                    tracer.add_neighbor_link(
+                                        from_node_id=unit_id,
+                                        to_node_id=neighbor_id,
+                                        link_type=link_type,
+                                        link_weight=link_weight,
+                                        entity_id=entity_id,
+                                        new_activation=new_activation,
+                                        followed=True
+                                    )
+                            elif tracer:
+                                tracer.add_neighbor_link(
+                                    from_node_id=unit_id,
+                                    to_node_id=neighbor_id,
+                                    link_type=link_type,
+                                    link_weight=link_weight,
+                                    entity_id=entity_id,
+                                    new_activation=new_activation,
+                                    followed=False,
+                                    prune_reason="activation_too_low"
+                                )
 
-                    # Step 4: Sort by final weight and return top results
-                    step_start = time.time()
-                    results.sort(key=lambda x: x["weight"], reverse=True)
-                    top_results = results[:top_k]
-                    print(f"  [4] Sort and return top {top_k}: {time.time() - step_start:.3f}s")
+                calculate_weight_time += time.time() - substep_start
+                process_neighbors_time += time.time() - substep_start
 
-                    print(f"[SEARCH] Complete: {len(top_results)} results in {time.time() - search_start:.3f}s\n")
-                    return top_results
+                # Clear batch for next iteration
+                nodes_to_process = []
 
-            except Exception as e:
-                print(f"[SEARCH] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
-                raise Exception(f"Failed to search memories: {str(e)}")
+            spreading_activation_time = time.time() - step_start
+            num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
+            print(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
+            print(f"      [3.1] Calculate weights: {calculate_weight_time:.3f}s")
+            print(f"      [3.2] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
+            print(f"      [3.3] Process neighbors: {process_neighbors_time:.3f}s")
+
+            if tracer:
+                tracer.add_phase_metric("spreading_activation", spreading_activation_time, {
+                    "nodes_visited": len(visited),
+                    "num_batches": num_batches
+                })
+
+            # Step 4: Queue access count updates (background worker will process them)
+            if visited_node_ids:
+                await self._access_count_queue.put(visited_node_ids)
+                print(f"  [4] Queued access count updates for {len(visited_node_ids)} nodes")
+
+            # Step 5: Sort by final weight and return top results
+            step_start = time.time()
+            results.sort(key=lambda x: x["weight"], reverse=True)
+            top_results = results[:top_k]
+            print(f"  [5] Sort and return top {top_k}: {time.time() - step_start:.3f}s")
+
+            print(f"[SEARCH] Complete: {len(top_results)} results in {time.time() - search_start:.3f}s\n")
+
+            # Finalize trace if enabled
+            if tracer:
+                trace = tracer.finalize(top_results)
+                return top_results, trace
+            return top_results, None
+
+        except Exception as e:
+            print(f"[SEARCH] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
+            raise Exception(f"Failed to search memories: {str(e)}")
 
     async def delete_agent(self, agent_id: str) -> Dict[str, int]:
         """

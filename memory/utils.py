@@ -62,22 +62,36 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     return dot_product / (magnitude1 * magnitude2)
 
 
-def calculate_recency_weight(days_since: float, decay_rate: float = 0.1) -> float:
+def calculate_recency_weight(days_since: float, half_life_days: float = 365.0) -> float:
     """
-    Calculate recency weight with exponential decay.
+    Calculate recency weight using logarithmic decay.
 
-    Recent memories are weighted higher. The decay rate controls
-    how quickly old memories fade.
+    This provides much better differentiation over long time periods compared to
+    exponential decay. Uses a log-based decay where the half-life parameter controls
+    when memories reach 50% weight.
+
+    Examples:
+        - Today (0 days): 1.0
+        - 1 year (365 days): ~0.5 (with default half_life=365)
+        - 2 years (730 days): ~0.33
+        - 5 years (1825 days): ~0.17
+        - 10 years (3650 days): ~0.09
+
+    This ensures that 2-year-old and 5-year-old memories have meaningfully
+    different weights, unlike exponential decay which makes them both ~0.
 
     Args:
         days_since: Number of days since the memory was created
-        decay_rate: How quickly memories fade (higher = faster decay)
+        half_life_days: Number of days for weight to reach 0.5 (default: 1 year)
 
     Returns:
         Weight between 0 and 1
     """
     import math
-    return math.exp(-decay_rate * days_since)
+    # Logarithmic decay: 1 / (1 + log(1 + days_since/half_life))
+    # This decays much slower than exponential, giving better long-term differentiation
+    normalized_age = days_since / half_life_days
+    return 1.0 / (1.0 + math.log1p(normalized_age))
 
 
 def calculate_frequency_weight(access_count: int, max_boost: float = 2.0) -> float:

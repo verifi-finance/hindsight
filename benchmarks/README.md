@@ -1,6 +1,32 @@
-# Benchmarks
+# Benchmark Suite
 
-This directory contains benchmark evaluations for the Entity-Aware Memory System.
+This directory contains a common benchmark framework and benchmark-specific implementations for evaluating the memory system.
+
+## Structure
+
+```
+benchmarks/
+├── common/                      # Common benchmark framework
+│   ├── benchmark_runner.py      # Main runner with all optimizations
+│   └── __init__.py
+├── locomo/                      # LoComo benchmark
+│   ├── locomo_benchmark.py      # LoComo-specific implementations
+│   ├── run_benchmark.py         # Runner script
+│   └── locomo10.json            # Dataset (place here)
+└── longmemeval/                 # LongMemEval benchmark
+    ├── longmemeval_benchmark.py # LongMemEval-specific implementations
+    ├── run_benchmark.py         # Runner script
+    └── longmemeval_s_cleaned.json # Dataset (auto-downloaded)
+```
+
+## Common Framework
+
+The common framework provides a unified interface with optimizations from the working LoComo implementation:
+- **Batch ingestion** via `put_batch_async`
+- **Parallel question processing** with rate limiting
+- **Parallel LLM judging** with configurable semaphore
+- **Progress tracking** with Rich
+- **Comprehensive metrics** collection
 
 ## LoComo Benchmark
 

@@ -1,0 +1,1041 @@
+// Global state
+let allGraphData = null;
+let cy = null;
+let debugPanes = [];
+let debugPaneCounter = 0;
+
+// Load data from API
+async function loadGraphData() {
+    try {
+        const response = await fetch('/api/graph');
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || `HTTP ${response.status}`);
+        }
+
+        allGraphData = await response.json();
+
+        // Validate response structure
+        if (!allGraphData || !allGraphData.nodes || !allGraphData.edges) {
+            throw new Error('Invalid response format from server');
+        }
+
+        // Update table
+        updateTable();
+
+        // Initialize graph
+        if (document.getElementById('graph-tab').classList.contains('active')) {
+            reloadGraph();
+        }
+
+        return allGraphData;
+    } catch (e) {
+        console.error('Error loading graph data:', e);
+        alert('Error loading graph data: ' + e.message);
+
+        // Show error in the UI
+        const cyDiv = document.getElementById('cy');
+        if (cyDiv) {
+            cyDiv.innerHTML = `
+                <div style="padding: 40px; text-align: center; color: #d32f2f;">
+                    <h3>Failed to load graph data</h3>
+                    <p>${e.message}</p>
+                    <button onclick="loadGraphData()" style="margin-top: 20px; padding: 10px 20px; background: #42a5f5; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Retry
+                    </button>
+                </div>
+            `;
+        }
+    }
+}
+
+// Refresh data from server
+function refreshData() {
+    loadGraphData();
+}
+
+// Update table with current data
+function updateTable() {
+    if (!allGraphData) return;
+
+    const tbody = document.getElementById('table-body');
+    const countSpan = document.getElementById('table-count');
+
+    countSpan.textContent = `(${allGraphData.total_units})`;
+
+    tbody.innerHTML = allGraphData.table_rows.map(row => `
+        <tr>
+            <td>${row.id}</td>
+            <td>${row.text}</td>
+            <td>${row.context}</td>
+            <td>${row.date}</td>
+            <td>${row.entities}</td>
+        </tr>
+    `).join('');
+}
+
+// Initialize graph with filtering
+function initGraph(nodeLimit, layoutName) {
+    if (!allGraphData) return;
+
+    // Filter nodes to limit
+    const limitedNodes = allGraphData.nodes.slice(0, nodeLimit);
+    const nodeIds = new Set(limitedNodes.map(n => n.data.id));
+
+    // Filter edges to only include those between visible nodes
+    const limitedEdges = allGraphData.edges.filter(e =>
+        nodeIds.has(e.data.source) && nodeIds.has(e.data.target)
+    );
+
+    // Update count display
+    document.getElementById('node-count').textContent =
+        `Showing ${limitedNodes.length} of ${allGraphData.nodes.length} nodes`;
+
+    // Destroy existing graph if any
+    if (cy) {
+        cy.destroy();
+    }
+
+    // Layout configurations
+    const layouts = {
+        'circle': {
+            name: 'circle',
+            animate: false,
+            radius: 300,
+            spacingFactor: 1.5
+        },
+        'grid': {
+            name: 'grid',
+            animate: false,
+            rows: Math.ceil(Math.sqrt(limitedNodes.length)),
+            cols: Math.ceil(Math.sqrt(limitedNodes.length)),
+            spacingFactor: 2
+        },
+        'cose': {
+            name: 'cose',
+            animate: false,
+            nodeRepulsion: 15000,
+            idealEdgeLength: 150,
+            edgeElasticity: 100,
+            nestingFactor: 1.2,
+            gravity: 1,
+            numIter: 1000,
+            initialTemp: 200,
+            coolingFactor: 0.95,
+            minTemp: 1.0
+        }
+    };
+
+    // Initialize Cytoscape
+    cy = cytoscape({
+        container: document.getElementById('cy'),
+
+        elements: [
+            ...limitedNodes.map(n => ({ data: n.data })),
+            ...limitedEdges.map(e => ({ data: e.data }))
+        ],
+
+        style: [
+            {
+                selector: 'node',
+                style: {
+                    'background-color': 'data(color)',
+                    'label': 'data(label)',
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                    'font-size': '10px',
+                    'font-weight': 'bold',
+                    'text-wrap': 'wrap',
+                    'text-max-width': '100px',
+                    'width': 40,
+                    'height': 40,
+                    'border-width': 2,
+                    'border-color': '#333'
+                }
+            },
+            {
+                selector: 'edge',
+                style: {
+                    'width': 1,
+                    'line-color': 'data(color)',
+                    'line-style': 'data(lineStyle)',
+                    'target-arrow-shape': 'triangle',
+                    'target-arrow-color': 'data(color)',
+                    'curve-style': 'bezier',
+                    'opacity': 0.7
+                }
+            },
+            {
+                selector: 'node:selected',
+                style: {
+                    'border-width': 4,
+                    'border-color': '#000'
+                }
+            }
+        ],
+
+        layout: layouts[layoutName] || layouts['circle']
+    });
+
+    // Simple tooltip on hover
+    let tooltip = null;
+
+    cy.on('mouseover', 'node', function(evt) {
+        const node = evt.target;
+        const data = node.data();
+        const renderedPosition = node.renderedPosition();
+
+        // Create tooltip
+        tooltip = document.createElement('div');
+        tooltip.className = 'tooltip';
+        tooltip.innerHTML = `
+            <b>Text:</b> ${data.text}<br>
+            <b>Context:</b> ${data.context}<br>
+            <b>Date:</b> ${data.date}<br>
+            <b>Entities:</b> ${data.entities}
+        `;
+        tooltip.style.left = renderedPosition.x + 20 + 'px';
+        tooltip.style.top = renderedPosition.y + 'px';
+        document.body.appendChild(tooltip);
+    });
+
+    cy.on('mouseout', 'node', function(evt) {
+        if (tooltip) {
+            tooltip.remove();
+            tooltip = null;
+        }
+    });
+}
+
+// Reload graph with current settings
+function reloadGraph() {
+    const nodeLimit = parseInt(document.getElementById('node-limit').value) || 50;
+    const layoutName = document.getElementById('layout-select').value;
+    initGraph(nodeLimit, layoutName);
+}
+
+// Load available agents
+let agentsLoaded = false;
+async function loadAgents() {
+    if (agentsLoaded) return;
+
+    try {
+        const response = await fetch('/api/agents');
+        const data = await response.json();
+
+        const select = document.getElementById('search-agent-id');
+        select.innerHTML = '';
+
+        if (data.agents && data.agents.length > 0) {
+            data.agents.forEach(agent => {
+                const option = document.createElement('option');
+                option.value = agent;
+                option.textContent = agent;
+                select.appendChild(option);
+            });
+            agentsLoaded = true;
+        } else {
+            select.innerHTML = '<option value="default">default</option>';
+        }
+    } catch (e) {
+        console.error('Error loading agents:', e);
+        const select = document.getElementById('search-agent-id');
+        select.innerHTML = '<option value="default">default</option>';
+    }
+}
+
+// Tab switching
+function switchTab(tabName) {
+    document.querySelectorAll('.tab-content').forEach(tab => {
+        tab.classList.remove('active');
+    });
+    document.querySelectorAll('.tab-button').forEach(btn => {
+        btn.classList.remove('active');
+    });
+
+    if (tabName === 'graph') {
+        document.getElementById('graph-tab').classList.add('active');
+        document.querySelectorAll('.tab-button')[0].classList.add('active');
+        if (cy) cy.resize();
+    } else if (tabName === 'table') {
+        document.getElementById('table-tab').classList.add('active');
+        document.querySelectorAll('.tab-button')[1].classList.add('active');
+    } else if (tabName === 'debug') {
+        document.getElementById('debug-tab').classList.add('active');
+        document.querySelectorAll('.tab-button')[2].classList.add('active');
+        // Initialize with one pane if empty
+        if (debugPanes.length === 0) {
+            addDebugPane();
+        }
+        // Resize all debug graphs
+        debugPanes.forEach(pane => {
+            if (pane.cy) {
+                pane.cy.resize();
+            }
+        });
+    } else if (tabName === 'locomo') {
+        document.getElementById('locomo-tab').classList.add('active');
+        document.querySelectorAll('.tab-button')[3].classList.add('active');
+    }
+}
+
+// Debug pane management
+function addDebugPane() {
+    const paneId = debugPaneCounter++;
+    const container = document.getElementById('debug-panes-container');
+
+    const paneDiv = document.createElement('div');
+    paneDiv.className = 'debug-pane';
+    paneDiv.id = `debug-pane-${paneId}`;
+    paneDiv.innerHTML = `
+        <div class="debug-pane-header">
+            Search Trace #${paneId + 1}
+            <button onclick="removeSpecificDebugPane(${paneId})" style="float: right; padding: 4px 12px; background: #ef5350; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">✕ Remove</button>
+        </div>
+        <div class="debug-search-controls">
+            <div style="display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;">
+                <div>
+                    <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;">Query:</label>
+                    <input type="text" id="search-query-${paneId}" placeholder="Enter search query..." style="width: 250px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                </div>
+                <div>
+                    <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;">Agent:</label>
+                    <select id="search-agent-${paneId}" style="width: 120px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;">Budget:</label>
+                    <input type="number" id="search-budget-${paneId}" value="100" min="10" max="1000" style="width: 70px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                </div>
+                <div>
+                    <label style="font-weight: bold; display: block; margin-bottom: 3px; font-size: 12px;">Top K:</label>
+                    <input type="number" id="search-top-k-${paneId}" value="10" min="1" max="50" style="width: 60px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;">
+                </div>
+                <button onclick="runSearchInPane(${paneId})" style="padding: 6px 16px; background: #42a5f5; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px;">🔍 Search</button>
+            </div>
+        </div>
+        <div class="debug-status-bar" id="debug-status-${paneId}">
+            <span style="color: #666;">Ready to search</span>
+        </div>
+        <div class="debug-controls">
+            <label>
+                <input type="radio" name="viz-mode-${paneId}" id="debug-mode-graph-${paneId}" checked> Graph View
+            </label>
+            <label>
+                <input type="radio" name="viz-mode-${paneId}" id="debug-mode-log-${paneId}"> Decision Log
+            </label>
+            <label>
+                <input type="radio" name="viz-mode-${paneId}" id="debug-mode-table-${paneId}"> Results Table
+            </label>
+            <span id="graph-controls-${paneId}" style="margin-left: 20px;">
+                <label>
+                    <input type="checkbox" id="debug-show-pruned-${paneId}"> Show pruned nodes
+                </label>
+                <label>
+                    <input type="checkbox" id="debug-highlight-path-${paneId}"> Highlight top result path
+                </label>
+            </span>
+        </div>
+        <div class="debug-viz-container">
+            <div class="debug-viz" id="debug-cy-${paneId}" style="display: block;"></div>
+            <div class="decision-log" id="decision-log-${paneId}" style="display: none;"></div>
+            <div class="results-table-container" id="results-table-${paneId}" style="display: none;"></div>
+        </div>
+    `;
+
+    container.appendChild(paneDiv);
+
+    // Add event listeners for view mode toggle
+    document.getElementById(`debug-mode-graph-${paneId}`).addEventListener('change', function() {
+        if (this.checked) {
+            document.getElementById(`debug-cy-${paneId}`).style.display = 'block';
+            document.getElementById(`decision-log-${paneId}`).style.display = 'none';
+            document.getElementById(`results-table-${paneId}`).style.display = 'none';
+            document.getElementById(`graph-controls-${paneId}`).style.display = 'inline';
+            const pane = debugPanes.find(p => p.id === paneId);
+            if (pane && pane.cy) {
+                setTimeout(() => pane.cy.resize(), 10);
+            }
+        }
+    });
+
+    document.getElementById(`debug-mode-log-${paneId}`).addEventListener('change', function() {
+        if (this.checked) {
+            document.getElementById(`debug-cy-${paneId}`).style.display = 'none';
+            document.getElementById(`decision-log-${paneId}`).style.display = 'block';
+            document.getElementById(`results-table-${paneId}`).style.display = 'none';
+            document.getElementById(`graph-controls-${paneId}`).style.display = 'none';
+        }
+    });
+
+    document.getElementById(`debug-mode-table-${paneId}`).addEventListener('change', function() {
+        if (this.checked) {
+            document.getElementById(`debug-cy-${paneId}`).style.display = 'none';
+            document.getElementById(`decision-log-${paneId}`).style.display = 'none';
+            document.getElementById(`results-table-${paneId}`).style.display = 'block';
+            document.getElementById(`graph-controls-${paneId}`).style.display = 'none';
+        }
+    });
+
+    // Add event listeners for graph controls
+    document.getElementById(`debug-show-pruned-${paneId}`).addEventListener('change', function() {
+        const pane = debugPanes.find(p => p.id === paneId);
+        if (pane && pane.trace) {
+            visualizeTrace(paneId, pane.trace);
+        }
+    });
+
+    document.getElementById(`debug-highlight-path-${paneId}`).addEventListener('change', function() {
+        const pane = debugPanes.find(p => p.id === paneId);
+        if (pane && pane.trace) {
+            visualizeTrace(paneId, pane.trace);
+        }
+    });
+
+    debugPanes.push({
+        id: paneId,
+        element: paneDiv,
+        cy: null,
+        trace: null
+    });
+
+    // Load agents for this pane after DOM is ready
+    setTimeout(() => loadAgentsForPane(paneId), 10);
+}
+
+async function loadAgentsForPane(paneId) {
+    const select = document.getElementById(`search-agent-${paneId}`);
+    if (!select) {
+        console.error(`Could not find select element for pane ${paneId}`);
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/agents');
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        select.innerHTML = '';
+
+        if (data.agents && data.agents.length > 0) {
+            data.agents.forEach(agent => {
+                const option = document.createElement('option');
+                option.value = agent;
+                option.textContent = agent;
+                select.appendChild(option);
+            });
+        } else {
+            select.innerHTML = '<option value="default">default</option>';
+        }
+    } catch (e) {
+        console.error('Error loading agents for pane:', paneId, e);
+        select.innerHTML = '<option value="default">default</option>';
+    }
+}
+
+window.runSearchInPane = async function(paneId) {
+    const pane = debugPanes.find(p => p.id === paneId);
+    if (!pane) return;
+
+    const query = document.getElementById(`search-query-${paneId}`).value;
+    const agentId = document.getElementById(`search-agent-${paneId}`).value;
+    const thinkingBudget = parseInt(document.getElementById(`search-budget-${paneId}`).value);
+    const topK = parseInt(document.getElementById(`search-top-k-${paneId}`).value);
+    const statusBar = document.getElementById(`debug-status-${paneId}`);
+
+    if (!query) {
+        alert('Please enter a query');
+        return;
+    }
+
+    try {
+        statusBar.innerHTML = '<span style="color: #ff9800;">🔄 Searching...</span>';
+
+        const response = await fetch('/api/search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                query: query,
+                agent_id: agentId,
+                thinking_budget: thinkingBudget,
+                top_k: topK
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.detail) {
+            statusBar.innerHTML = `<span style="color: #d32f2f;">❌ Error: ${data.detail}</span>`;
+            return;
+        }
+
+        // Update status bar with stats
+        const summary = data.trace.summary;
+        statusBar.innerHTML = `
+            <span style="color: #43a047;">✓ Search complete</span>
+            <span style="margin: 0 10px; color: #666;">|</span>
+            <span><strong>Nodes visited:</strong> ${summary.total_nodes_visited}</span>
+            <span style="margin: 0 10px; color: #666;">|</span>
+            <span><strong>Entry points:</strong> ${summary.entry_points_found}</span>
+            <span style="margin: 0 10px; color: #666;">|</span>
+            <span><strong>Budget used:</strong> ${summary.budget_used} / ${summary.budget_used + summary.budget_remaining}</span>
+            <span style="margin: 0 10px; color: #666;">|</span>
+            <span><strong>Results:</strong> ${summary.results_returned}</span>
+            <span style="margin: 0 10px; color: #666;">|</span>
+            <span><strong>Duration:</strong> ${summary.total_duration_seconds.toFixed(2)}s</span>
+        `;
+
+        // Visualize the trace and results
+        pane.trace = data.trace;
+        pane.results = data.results;
+        visualizeTrace(paneId, data.trace);
+        renderDecisionLog(paneId, data.trace);
+        renderResultsTable(paneId, data.results, data.trace);
+
+    } catch (e) {
+        statusBar.innerHTML = `<span style="color: #d32f2f;">❌ Error: ${e.message}</span>`;
+        console.error('Error running search:', e);
+    }
+}
+
+window.removeSpecificDebugPane = function(paneId) {
+    const paneIndex = debugPanes.findIndex(p => p.id === paneId);
+    if (paneIndex === -1) return;
+
+    const pane = debugPanes[paneIndex];
+    if (pane.cy) {
+        pane.cy.destroy();
+    }
+    pane.element.remove();
+    debugPanes.splice(paneIndex, 1);
+}
+
+function removeDebugPane() {
+    if (debugPanes.length === 0) return;
+
+    const pane = debugPanes.pop();
+    if (pane.cy) {
+        pane.cy.destroy();
+    }
+    pane.element.remove();
+}
+
+function renderResultsTable(paneId, results, trace) {
+    const tableDiv = document.getElementById(`results-table-${paneId}`);
+    if (!tableDiv) return;
+
+    if (!results || results.length === 0) {
+        tableDiv.innerHTML = '<div style="padding: 40px; text-align: center; color: #666;">No results returned</div>';
+        return;
+    }
+
+    let html = `
+        <div style="padding: 20px; overflow: auto; height: 100%;">
+            <h3>Search Results (${results.length} memories)</h3>
+            <p style="color: #666; font-size: 13px; margin-bottom: 15px;">
+                Query: "${trace.query.query_text}"
+            </p>
+            <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                <thead>
+                    <tr style="background: #f0f0f0; border: 2px solid #333;">
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Rank</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Text</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Context</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;">Date</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Final weighted score">Final Score</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Spreading activation value">Activation</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Semantic similarity to query">Similarity</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Recency boost">Recency</th>
+                        <th style="padding: 8px; text-align: left; border: 1px solid #ddd;" title="Frequency boost">Frequency</th>
+                    </tr>
+                </thead>
+                <tbody>
+    `;
+
+    results.forEach((result, idx) => {
+        // Find corresponding visit in trace
+        const visit = trace.visits.find(v => v.node_id === result.id);
+
+        // Get scores from visit weights
+        const finalScore = visit ? visit.weights.final_weight : (result.score || 0);
+        const activation = visit ? visit.weights.activation : 0;
+        const similarity = visit ? visit.weights.semantic_similarity : 0;
+        const recency = visit ? (visit.weights.recency || 0) : 0;
+        const frequency = visit ? (visit.weights.frequency || 0) : 0;
+
+        html += `
+            <tr style="border: 1px solid #ddd;">
+                <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">#${idx + 1}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; max-width: 300px;">${result.text}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; max-width: 150px;">${result.context || 'N/A'}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; white-space: nowrap;">${result.event_date ? new Date(result.event_date).toLocaleDateString() : 'N/A'}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;"><strong>${finalScore.toFixed(4)}</strong></td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${activation.toFixed(4)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${similarity.toFixed(4)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${recency.toFixed(4)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">${frequency.toFixed(4)}</td>
+            </tr>
+        `;
+    });
+
+    html += `
+                </tbody>
+            </table>
+        </div>
+    `;
+
+    tableDiv.innerHTML = html;
+}
+
+function renderDecisionLog(paneId, trace) {
+    const logDiv = document.getElementById(`decision-log-${paneId}`);
+    if (!logDiv || !trace) return;
+
+    // Group visits by step
+    const stepGroups = {};
+    trace.visits.forEach(visit => {
+        if (!stepGroups[visit.step]) {
+            stepGroups[visit.step] = [];
+        }
+        stepGroups[visit.step].push(visit);
+    });
+
+    // Build HTML for decision log
+    let html = `
+        <div class="log-header">
+            <h3>Search Execution Trace</h3>
+            <p><strong>Query:</strong> "${trace.query.query_text}"</p>
+            <p class="log-explanation">
+                This log shows the step-by-step decision process of the spreading activation search algorithm.
+                The search starts from entry points (semantically similar memories) and spreads through connected memories,
+                following temporal, semantic, and entity links to find relevant results.
+            </p>
+        </div>
+    `;
+
+    const maxStep = Math.max(...Object.keys(stepGroups).map(k => parseInt(k)));
+
+    for (let step = 0; step <= maxStep; step++) {
+        const visits = stepGroups[step] || [];
+        if (visits.length === 0) continue;
+
+        html += `<div class="log-step">`;
+        html += `<div class="log-step-header">Step ${step}</div>`;
+
+        if (step === 0) {
+            html += `<div class="log-step-explanation">
+                🎯 <strong>Finding Entry Points:</strong> Searching for memories semantically similar to the query.
+                These are the starting points for spreading activation.
+            </div>`;
+        } else {
+            html += `<div class="log-step-explanation">
+                🔍 <strong>Spreading Activation:</strong> Following links from previously activated memories.
+                The algorithm explores connected memories and calculates their relevance.
+            </div>`;
+        }
+
+        visits.forEach((visit, idx) => {
+            const isEntry = visit.is_entry_point;
+            const isResult = visit.final_rank !== null;
+            const hasParent = visit.parent_node_id !== null;
+
+            let cardClass = 'log-card';
+            if (isEntry) cardClass += ' log-card-entry';
+            if (isResult) cardClass += ' log-card-result';
+
+            html += `<div class="${cardClass}">`;
+
+            // Header
+            if (isEntry) {
+                html += `<div class="log-card-header">
+                    <span class="log-badge log-badge-entry">Entry Point</span>
+                    ${isResult ? `<span class="log-badge log-badge-result">Rank #${visit.final_rank}</span>` : ''}
+                </div>`;
+            } else if (hasParent) {
+                const linkTypeIcon = {
+                    'temporal': '⏱️',
+                    'semantic': '🔗',
+                    'entity': '👤'
+                };
+                const icon = linkTypeIcon[visit.link_type] || '➡️';
+                html += `<div class="log-card-header">
+                    <span class="log-badge log-badge-${visit.link_type}">${icon} ${visit.link_type} link</span>
+                    ${isResult ? `<span class="log-badge log-badge-result">Rank #${visit.final_rank}</span>` : ''}
+                </div>`;
+            }
+
+            // Memory text
+            html += `<div class="log-memory-text">"${visit.text}"</div>`;
+
+            // Decision details
+            html += `<div class="log-details">`;
+
+            if (isEntry) {
+                html += `
+                    <div class="log-detail-row">
+                        <span class="log-detail-label">Why selected:</span>
+                        <span class="log-detail-value">Semantic similarity to query = ${visit.weights.semantic_similarity.toFixed(3)}</span>
+                    </div>
+                `;
+            } else if (hasParent) {
+                html += `
+                    <div class="log-detail-row">
+                        <span class="log-detail-label">Activated from:</span>
+                        <span class="log-detail-value">Node ${visit.parent_node_id.substring(0, 8)}... via ${visit.link_type} link</span>
+                    </div>
+                    <div class="log-detail-row">
+                        <span class="log-detail-label">Link weight:</span>
+                        <span class="log-detail-value">${visit.link_weight.toFixed(3)}</span>
+                    </div>
+                `;
+            }
+
+            html += `
+                <div class="log-detail-row">
+                    <span class="log-detail-label">Activation:</span>
+                    <span class="log-detail-value">${visit.weights.activation.toFixed(3)}</span>
+                    <span class="log-detail-help" title="Combined score from parent activation and link weight">ℹ️</span>
+                </div>
+                <div class="log-detail-row">
+                    <span class="log-detail-label">Semantic similarity:</span>
+                    <span class="log-detail-value">${visit.weights.semantic_similarity.toFixed(3)}</span>
+                    <span class="log-detail-help" title="How semantically similar this memory is to the original query">ℹ️</span>
+                </div>
+                <div class="log-detail-row">
+                    <span class="log-detail-label">Final weight:</span>
+                    <span class="log-detail-value"><strong>${visit.weights.final_weight.toFixed(3)}</strong></span>
+                    <span class="log-detail-help" title="Final score = activation × semantic_similarity">ℹ️</span>
+                </div>
+            `;
+
+            html += `</div>`; // log-details
+            html += `</div>`; // log-card
+        });
+
+        html += `</div>`; // log-step
+    }
+
+    // Add pruned nodes section if any
+    if (trace.pruned && trace.pruned.length > 0) {
+        html += `<div class="log-step">`;
+        html += `<div class="log-step-header">Pruned Nodes</div>`;
+        html += `<div class="log-step-explanation">
+            ✂️ <strong>Budget Limit Reached:</strong> These nodes were not explored to conserve computational resources.
+        </div>`;
+
+        trace.pruned.forEach(pruned => {
+            html += `<div class="log-card log-card-pruned">`;
+            html += `<div class="log-card-header">
+                <span class="log-badge log-badge-pruned">Pruned</span>
+            </div>`;
+            html += `<div class="log-details">`;
+            html += `<div class="log-detail-row">
+                <span class="log-detail-label">Reason:</span>
+                <span class="log-detail-value">${pruned.reason}</span>
+            </div>`;
+            html += `<div class="log-detail-row">
+                <span class="log-detail-label">Activation:</span>
+                <span class="log-detail-value">${pruned.activation.toFixed(3)}</span>
+            </div>`;
+            html += `</div></div>`;
+        });
+
+        html += `</div>`;
+    }
+
+    logDiv.innerHTML = html;
+}
+
+function visualizeTrace(paneId, trace) {
+    const pane = debugPanes.find(p => p.id === paneId);
+    if (!pane || !trace) return;
+
+    const cyDiv = document.getElementById(`debug-cy-${paneId}`);
+    if (!cyDiv) return;
+
+    const showPruned = document.getElementById(`debug-show-pruned-${paneId}`).checked;
+    const highlightPath = document.getElementById(`debug-highlight-path-${paneId}`).checked;
+
+    try {
+        // Build graph from trace
+        const nodes = [];
+        const edges = [];
+        const visitedNodeIds = new Set();
+
+        // Add all visited nodes
+        trace.visits.forEach((visit, idx) => {
+            visitedNodeIds.add(visit.node_id);
+
+            // Determine node color based on properties
+            let color = '#90caf9'; // default
+            if (visit.is_entry_point) {
+                color = '#66bb6a'; // green for entry points
+            } else if (visit.final_rank !== null) {
+                color = '#ffd54f'; // yellow for results
+            }
+
+            nodes.push({
+                data: {
+                    id: visit.node_id,
+                    label: `${visit.text.substring(0, 30)}...`,
+                    text: visit.text,
+                    step: visit.step,
+                    rank: visit.final_rank,
+                    activation: visit.weights.activation.toFixed(3),
+                    similarity: visit.weights.semantic_similarity.toFixed(3),
+                    finalWeight: visit.weights.final_weight.toFixed(3),
+                    isEntry: visit.is_entry_point,
+                    color: color
+                }
+            });
+
+            // Add edge from parent if exists
+            if (visit.parent_node_id) {
+                let edgeColor = '#999';
+                if (visit.link_type === 'temporal') edgeColor = '#00bcd4';
+                else if (visit.link_type === 'semantic') edgeColor = '#ff69b4';
+                else if (visit.link_type === 'entity') edgeColor = '#ffd700';
+
+                edges.push({
+                    data: {
+                        id: `${visit.parent_node_id}-${visit.node_id}`,
+                        source: visit.parent_node_id,
+                        target: visit.node_id,
+                        linkType: visit.link_type,
+                        linkWeight: visit.link_weight,
+                        color: edgeColor
+                    }
+                });
+            }
+        });
+
+        // Add pruned nodes if requested
+        if (showPruned && trace.pruned) {
+            trace.pruned.forEach(pruned => {
+                if (!visitedNodeIds.has(pruned.node_id)) {
+                    nodes.push({
+                        data: {
+                            id: pruned.node_id,
+                            label: 'Pruned',
+                            text: `Pruned: ${pruned.reason}`,
+                            activation: pruned.activation.toFixed(3),
+                            color: '#ef5350' // red for pruned
+                        }
+                    });
+                }
+            });
+        }
+
+        // Destroy existing graph
+        if (pane.cy) {
+            pane.cy.destroy();
+        }
+
+        // Add legend/explanation to the graph view
+        const existingLegend = cyDiv.querySelector('.search-graph-legend');
+        if (existingLegend) {
+            existingLegend.remove();
+        }
+
+        const legend = document.createElement('div');
+        legend.className = 'search-graph-legend';
+        legend.innerHTML = `
+            <h4 style="margin: 0 0 10px 0; border-bottom: 2px solid #333; padding-bottom: 5px;">🔍 Graph Legend</h4>
+            <div style="font-size: 12px; line-height: 1.6;">
+                <p style="margin: 5px 0 8px 0; font-weight: bold;">Node Colors:</p>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 20px; height: 20px; background: #66bb6a; border: 2px solid #333; border-radius: 50%; margin-right: 8px;"></div>
+                    <span>Entry points - semantically similar to query</span>
+                </div>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 20px; height: 20px; background: #ffd54f; border: 2px solid #333; border-radius: 50%; margin-right: 8px;"></div>
+                    <span>Results - returned as answers</span>
+                </div>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 20px; height: 20px; background: #90caf9; border: 2px solid #333; border-radius: 50%; margin-right: 8px;"></div>
+                    <span>Visited - explored but not in results</span>
+                </div>
+
+                <p style="margin: 12px 0 8px 0; font-weight: bold;">Link Types:</p>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 30px; height: 3px; background: #00bcd4; margin-right: 8px;"></div>
+                    <span><strong>Temporal</strong> - memories close in time</span>
+                </div>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 30px; height: 3px; background: #ff69b4; margin-right: 8px;"></div>
+                    <span><strong>Semantic</strong> - similar content/meaning</span>
+                </div>
+                <div style="margin: 5px 0; display: flex; align-items: center;">
+                    <div style="width: 30px; height: 3px; background: #ffd700; margin-right: 8px;"></div>
+                    <span><strong>Entity</strong> - same person/place/thing</span>
+                </div>
+
+                <p style="margin: 12px 0 5px 0; font-size: 11px; color: #666; font-style: italic;">
+                    Layout: Rows represent search depth from entry points
+                </p>
+            </div>
+        `;
+        cyDiv.appendChild(legend);
+
+        // Create new graph
+        pane.cy = cytoscape({
+            container: cyDiv,
+            elements: [...nodes, ...edges],
+            style: [
+                {
+                    selector: 'node',
+                    style: {
+                        'background-color': 'data(color)',
+                        'label': 'data(label)',
+                        'text-valign': 'center',
+                        'text-halign': 'center',
+                        'font-size': '10px',
+                        'font-weight': 'bold',
+                        'text-wrap': 'wrap',
+                        'text-max-width': '100px',
+                        'width': 50,
+                        'height': 50,
+                        'border-width': 2,
+                        'border-color': '#333'
+                    }
+                },
+                {
+                    selector: 'edge',
+                    style: {
+                        'width': 2,
+                        'line-color': 'data(color)',
+                        'target-arrow-shape': 'triangle',
+                        'target-arrow-color': 'data(color)',
+                        'curve-style': 'bezier',
+                        'opacity': 0.8
+                    }
+                },
+                {
+                    selector: 'node:selected',
+                    style: {
+                        'border-width': 4,
+                        'border-color': '#000'
+                    }
+                }
+            ],
+            layout: {
+                name: 'breadthfirst',
+                directed: true,
+                spacingFactor: 1.5,
+                animate: false
+            }
+        });
+
+        // Highlight path to top result if requested
+        if (highlightPath && trace.visits.length > 0) {
+            const topResult = trace.visits.find(v => v.final_rank === 1);
+            if (topResult) {
+                const pathNodes = [];
+                let current = topResult;
+                while (current) {
+                    pathNodes.push(current.node_id);
+                    current = trace.visits.find(v => v.node_id === current.parent_node_id);
+                }
+
+                pathNodes.forEach(nodeId => {
+                    pane.cy.$(`#${nodeId}`).style({
+                        'border-width': 5,
+                        'border-color': '#ff5722'
+                    });
+                });
+            }
+        }
+
+        // Add tooltips
+        let tooltip = null;
+        pane.cy.on('mouseover', 'node', function(evt) {
+            const node = evt.target;
+            const data = node.data();
+            const pos = node.renderedPosition();
+
+            tooltip = document.createElement('div');
+            tooltip.className = 'tooltip';
+            tooltip.innerHTML = `
+                <b>Text:</b> ${data.text}<br>
+                ${data.step ? `<b>Step:</b> ${data.step}<br>` : ''}
+                ${data.rank !== null && data.rank !== undefined ? `<b>Rank:</b> ${data.rank}<br>` : ''}
+                ${data.activation ? `<b>Activation:</b> ${data.activation}<br>` : ''}
+                ${data.similarity ? `<b>Similarity:</b> ${data.similarity}<br>` : ''}
+                ${data.finalWeight ? `<b>Final Weight:</b> ${data.finalWeight}` : ''}
+            `;
+
+            // Get container bounds
+            const container = cyDiv.getBoundingClientRect();
+
+            // Position tooltip relative to container
+            let left = pos.x + 20;
+            let top = pos.y;
+
+            // Append to body temporarily to get dimensions
+            document.body.appendChild(tooltip);
+            const tooltipRect = tooltip.getBoundingClientRect();
+
+            // Adjust if tooltip would go off right edge
+            if (container.left + left + tooltipRect.width > window.innerWidth) {
+                left = pos.x - tooltipRect.width - 20;
+            }
+
+            // Adjust if tooltip would go off bottom edge
+            if (container.top + top + tooltipRect.height > window.innerHeight) {
+                top = pos.y - tooltipRect.height;
+            }
+
+            // Adjust if tooltip would go off left edge
+            if (container.left + left < 0) {
+                left = 20;
+            }
+
+            // Adjust if tooltip would go off top edge
+            if (container.top + top < 0) {
+                top = 20;
+            }
+
+            tooltip.style.left = (container.left + left) + 'px';
+            tooltip.style.top = (container.top + top) + 'px';
+        });
+
+        pane.cy.on('mouseout', 'node', function() {
+            if (tooltip) {
+                tooltip.remove();
+                tooltip = null;
+            }
+        });
+
+    } catch (e) {
+        console.error('Error visualizing trace:', e);
+        // Show error in status bar
+        const statusBar = document.getElementById(`debug-status-${paneId}`);
+        if (statusBar) {
+            statusBar.innerHTML = `<span style="color: #d32f2f;">❌ Error visualizing trace: ${e.message}</span>`;
+        }
+    }
+}
+
+// Table filtering
+document.getElementById('table-filter').addEventListener('input', function() {
+    const filterValue = this.value.toLowerCase();
+    const rows = document.querySelectorAll('#memory-table tbody tr');
+
+    rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        if (text.includes(filterValue)) {
+            row.style.display = '';
+        } else {
+            row.style.display = 'none';
+        }
+    });
+});
+
+// Don't auto-load data on page load - wait for user to click load button

@@ -96,19 +96,78 @@ The search algorithm explores the memory graph using spreading activation:
 4. **Thinking Budget**: Limit exploration to N units (controls computational cost)
 5. **Dynamic Weighting**: Combine activation, semantic similarity, recency, and frequency:
    ```
-   final_weight = 0.30 × activation + 0.30 × semantic_similarity + 0.25 × recency + 0.15 × frequency
+   final_weight = w_a × activation + w_s × semantic_similarity + w_r × recency + w_f × frequency
+
+   # Default weights (configurable via search parameters):
+   w_a = 0.30  # Activation weight
+   w_s = 0.30  # Semantic similarity weight
+   w_r = 0.25  # Recency weight
+   w_f = 0.15  # Frequency weight
 
    semantic_similarity = cosine_similarity(query_embedding, memory_embedding)
-   recency = exp(-0.1 × days_since)
+   recency = 1 / (1 + log(1 + days_since/365))  # Logarithmic decay with 1-year half-life
    frequency = normalized to [0, 1] from log(access_count + 1) / log(10)
    ```
+
+   **Weight Tuning**: All weights are configurable via `search_async()` parameters, enabling benchmark experiments with different scoring strategies (e.g., emphasizing graph structure vs semantic similarity).
+
+   Recency uses logarithmic decay to provide meaningful differentiation over years:
+     - Today: 1.000 (100% weight)
+       - 1 week: 0.981 (barely any decay)
+       - 1 month: 0.927 (still very recent)
+       - 3 months: 0.819 (recent)
+       - 6 months: 0.714
+       - 1 year: 0.591 (half-life point)
+       - 2 years: 0.477 ✓
+       - 5 years: 0.358 ✓ (clearly different from 2 years!)
+       - 10 years: 0.294 ✓
+
+   This ensures old memories (2yr vs 5yr) have different weights, unlike exponential decay.
 6. **Return Top-K**: Sort by final weight and return top results
 
 This approach ensures:
-- Semantic relevance to query is always considered (30% weight)
-- Graph structure influences results through activation (30% weight)
-- Recently accessed memories get boosted (25% weight - recency bias)
-- Frequently accessed memories get boosted (15% weight - importance signal)
+- Semantic relevance to query is always considered (default 30% weight)
+- Graph structure influences results through activation (default 30% weight)
+- Recently accessed memories get boosted (default 25% weight - recency bias)
+- Frequently accessed memories get boosted (default 15% weight - importance signal)
+
+### Search Tracing & Debugging
+
+The system includes comprehensive search tracing to understand and debug the search process:
+
+**Enable tracing**:
+```python
+results, trace = memory.search(
+    agent_id="agent_1",
+    query="Who works at Google?",
+    enable_trace=True  # Returns detailed SearchTrace object
+)
+```
+
+**Trace captures**:
+- Every node visited with parent/child relationships
+- All links explored (followed or pruned) with reasons
+- Weight calculations broken down by component
+- Entry points selected and their similarity scores
+- Pruning decisions (already visited, activation too low, budget exhausted)
+- Performance metrics for each search phase
+
+**Export trace for visualization**:
+```python
+# Save trace as JSON for external visualization tools
+trace_json = trace.to_json()
+with open("trace.json", "w") as f:
+    f.write(trace_json)
+```
+
+**Use cases**:
+- Understanding why certain memories were/weren't retrieved
+- Debugging search behavior
+- Analyzing link type effectiveness
+- Performance profiling
+- Building custom visualization layers
+
+See `SEARCH_TRACE.md` for complete trace API documentation and `examples/trace_example.py` for a working demo.
 
 ### Self-Contained Memory Units
 
@@ -291,7 +350,8 @@ memory.put(
 ### Search Memories
 
 ```python
-results = memory.search(
+# Basic search (trace disabled by default)
+results, trace = memory.search(
     agent_id="agent_1",
     query="What does Alice do?",
     thinking_budget=50,  # How many units to explore
@@ -300,6 +360,32 @@ results = memory.search(
 
 for result in results:
     print(f"{result['text']} (weight: {result['weight']:.3f})")
+
+# Search with tracing for debugging
+results, trace = memory.search(
+    agent_id="agent_1",
+    query="What does Alice do?",
+    thinking_budget=50,
+    top_k=10,
+    enable_trace=True  # Returns detailed SearchTrace object
+)
+
+# Analyze trace
+print(f"Nodes visited: {trace.summary.total_nodes_visited}")
+print(f"Entry points: {len(trace.entry_points)}")
+trace_json = trace.to_json()  # Export for visualization
+
+# Search with custom weight tuning
+results, trace = memory.search(
+    agent_id="agent_1",
+    query="What does Alice do?",
+    thinking_budget=50,
+    top_k=10,
+    weight_activation=0.40,   # Emphasize graph structure
+    weight_semantic=0.40,     # Emphasize semantic similarity
+    weight_recency=0.10,      # De-emphasize recency
+    weight_frequency=0.10     # De-emphasize frequency
+)
 ```
 
 ## How It Works: Example

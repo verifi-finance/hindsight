@@ -4,7 +4,32 @@ Memory System for AI Agents.
 Temporal + Semantic Memory Architecture using PostgreSQL with pgvector.
 """
 from .temporal_semantic_memory import TemporalSemanticMemory
-from .visualizer import MemoryVisualizer, LiveSearchTracer
+from .visualizer import MemoryVisualizer
+from .search_trace import (
+    SearchTrace,
+    QueryInfo,
+    EntryPoint,
+    NodeVisit,
+    WeightComponents,
+    LinkInfo,
+    PruningDecision,
+    SearchSummary,
+    SearchPhaseMetrics,
+)
+from .search_tracer import SearchTracer
 
-__all__ = ["TemporalSemanticMemory", "MemoryVisualizer", "LiveSearchTracer"]
+__all__ = [
+    "TemporalSemanticMemory",
+    "MemoryVisualizer",
+    "SearchTrace",
+    "SearchTracer",
+    "QueryInfo",
+    "EntryPoint",
+    "NodeVisit",
+    "WeightComponents",
+    "LinkInfo",
+    "PruningDecision",
+    "SearchSummary",
+    "SearchPhaseMetrics",
+]
 __version__ = "0.1.0"

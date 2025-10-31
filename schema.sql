@@ -97,3 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_links_from ON memory_links(from_unit_id);
 CREATE INDEX IF NOT EXISTS idx_memory_links_to ON memory_links(to_unit_id);
 CREATE INDEX IF NOT EXISTS idx_memory_links_type ON memory_links(link_type);
 CREATE INDEX IF NOT EXISTS idx_memory_links_entity ON memory_links(entity_id) WHERE entity_id IS NOT NULL;
+
+-- Composite index for spreading activation neighbor queries (from_unit_id + weight filter)
+CREATE INDEX IF NOT EXISTS idx_memory_links_from_weight ON memory_links(from_unit_id, weight DESC)
+WHERE weight >= 0.1;
