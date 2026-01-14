@@ -37,6 +37,7 @@ from hindsight_api import MemoryEngine
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memory_engine import Budget, fq_table
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, TokenUsage
+from hindsight_api.engine.search.tags import TagsMatch
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
 from hindsight_api.metrics import create_metrics_collector, get_metrics_collector, initialize_metrics
 from hindsight_api.models import RequestContext
@@ -81,6 +82,8 @@ class RecallRequest(BaseModel):
                 "trace": True,
                 "query_timestamp": "2023-05-30T23:40:00",
                 "include": {"entities": {"max_tokens": 500}},
+                "tags": ["user_a"],
+                "tags_match": "any",
             }
         }
     )
@@ -98,6 +101,15 @@ class RecallRequest(BaseModel):
     include: IncludeOptions = Field(
         default_factory=IncludeOptions,
         description="Options for including additional data (entities are included by default)",
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description="Filter memories by tags. If not specified, all memories are returned.",
+    )
+    tags_match: TagsMatch = Field(
+        default="any",
+        description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
     )
 
 
@@ -119,6 +131,7 @@ class RecallResult(BaseModel):
                 "document_id": "session_abc123",
                 "metadata": {"source": "slack"},
                 "chunk_id": "456e7890-e12b-34d5-a678-901234567890",
+                "tags": ["user_a", "user_b"],
             }
         },
     }
@@ -134,6 +147,7 @@ class RecallResult(BaseModel):
     document_id: str | None = None  # Document this memory belongs to
     metadata: dict[str, str] | None = None  # User-defined metadata
     chunk_id: str | None = None  # Chunk this fact was extracted from
+    tags: list[str] | None = None  # Visibility scope tags
 
 
 class EntityObservationResponse(BaseModel):
@@ -188,12 +202,18 @@ class EntityListResponse(BaseModel):
                         "first_seen": "2024-01-15T10:30:00Z",
                         "last_seen": "2024-02-01T14:00:00Z",
                     }
-                ]
+                ],
+                "total": 150,
+                "limit": 100,
+                "offset": 0,
             }
         }
     )
 
     items: list[EntityListItem]
+    total: int
+    limit: int
+    offset: int
 
 
 class EntityDetailResponse(BaseModel):
@@ -300,6 +320,7 @@ class MemoryItem(BaseModel):
                 "metadata": {"source": "slack", "channel": "engineering"},
                 "document_id": "meeting_notes_2024_01_15",
                 "entities": [{"text": "Alice"}, {"text": "ML model", "type": "CONCEPT"}],
+                "tags": ["user_a", "user_b"],
             }
         },
     )
@@ -312,6 +333,10 @@ class MemoryItem(BaseModel):
     entities: list[EntityInput] | None = Field(
         default=None,
         description="Optional entities to combine with auto-extracted entities.",
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description="Optional tags for visibility scoping. Memories with tags can be filtered during recall.",
     )
 
     @field_validator("timestamp", mode="before")
@@ -347,6 +372,7 @@ class RetainRequest(BaseModel):
                     },
                 ],
                 "async": False,
+                "document_tags": ["user_a", "user_b"],
             }
         }
     )
@@ -356,6 +382,10 @@ class RetainRequest(BaseModel):
         default=False,
         alias="async",
         description="If true, process asynchronously in background. If false, wait for completion (default: false)",
+    )
+    document_tags: list[str] | None = Field(
+        default=None,
+        description="Tags applied to all items in this request. These are merged with any item-level tags.",
     )
 
 
@@ -380,6 +410,10 @@ class RetainResponse(BaseModel):
     items_count: int
     is_async: bool = Field(
         alias="async", serialization_alias="async", description="Whether the operation was processed asynchronously"
+    )
+    operation_id: str | None = Field(
+        default=None,
+        description="Operation ID for tracking async operations. Use GET /v1/default/banks/{bank_id}/operations to list operations and find this ID. Only present when async=true.",
     )
     usage: TokenUsage | None = Field(
         default=None,
@@ -421,6 +455,8 @@ class ReflectRequest(BaseModel):
                     },
                     "required": ["summary", "key_points"],
                 },
+                "tags": ["user_a"],
+                "tags_match": "any",
             }
         }
     )
@@ -435,6 +471,15 @@ class ReflectRequest(BaseModel):
     response_schema: dict | None = Field(
         default=None,
         description="Optional JSON Schema for structured output. When provided, the response will include a 'structured_output' field with the LLM response parsed according to this schema.",
+    )
+    tags: list[str] | None = Field(
+        default=None,
+        description="Filter memories by tags during reflection. If not specified, all memories are considered.",
+    )
+    tags_match: TagsMatch = Field(
+        default="any",
+        description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
     )
 
 
@@ -647,6 +692,7 @@ class GraphDataResponse(BaseModel):
                     }
                 ],
                 "total_units": 2,
+                "limit": 1000,
             }
         }
     )
@@ -655,6 +701,7 @@ class GraphDataResponse(BaseModel):
     edges: list[dict[str, Any]]
     table_rows: list[dict[str, Any]]
     total_units: int
+    limit: int
 
 
 class ListMemoryUnitsResponse(BaseModel):
@@ -716,6 +763,37 @@ class ListDocumentsResponse(BaseModel):
     offset: int
 
 
+class TagItem(BaseModel):
+    """Single tag with usage count."""
+
+    tag: str = Field(description="The tag value")
+    count: int = Field(description="Number of memories with this tag")
+
+
+class ListTagsResponse(BaseModel):
+    """Response model for list tags endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "items": [
+                    {"tag": "user:alice", "count": 42},
+                    {"tag": "user:bob", "count": 15},
+                    {"tag": "session:abc123", "count": 8},
+                ],
+                "total": 25,
+                "limit": 100,
+                "offset": 0,
+            }
+        }
+    )
+
+    items: list[TagItem]
+    total: int
+    limit: int
+    offset: int
+
+
 class DocumentResponse(BaseModel):
     """Response model for get document endpoint."""
 
@@ -729,6 +807,7 @@ class DocumentResponse(BaseModel):
                 "created_at": "2024-01-15T10:30:00Z",
                 "updated_at": "2024-01-15T10:30:00Z",
                 "memory_unit_count": 15,
+                "tags": ["user_a", "session_123"],
             }
         }
     )
@@ -740,6 +819,7 @@ class DocumentResponse(BaseModel):
     created_at: str
     updated_at: str
     memory_unit_count: int
+    tags: list[str] = Field(default_factory=list, description="Tags associated with this document")
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -951,6 +1031,12 @@ def create_app(
             await memory.initialize()
             logging.info("Memory system initialized")
 
+            # Set up DB pool metrics after memory initialization
+            metrics_collector = get_metrics_collector()
+            if memory._pool is not None and hasattr(metrics_collector, "set_db_pool"):
+                metrics_collector.set_db_pool(memory._pool)
+                logging.info("DB pool metrics configured")
+
         # Call HTTP extension startup hook
         if http_extension:
             await http_extension.on_startup()
@@ -986,6 +1072,30 @@ def create_app(
     # IMPORTANT: Set memory on app.state immediately, don't wait for lifespan
     # This is required for mounted sub-applications where lifespan may not fire
     app.state.memory = memory
+
+    # Add HTTP metrics middleware
+    @app.middleware("http")
+    async def http_metrics_middleware(request, call_next):
+        """Record HTTP request metrics."""
+        # Normalize endpoint path to reduce cardinality
+        # Replace UUIDs and numeric IDs with placeholders
+        import re
+
+        from starlette.requests import Request
+
+        path = request.url.path
+        # Replace UUIDs
+        path = re.sub(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "/{id}", path)
+        # Replace numeric IDs
+        path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
+
+        status_code = [500]  # Default to 500, will be updated
+        metrics_collector = get_metrics_collector()
+
+        with metrics_collector.record_http_request(request.method, path, lambda: status_code[0]):
+            response = await call_next(request)
+            status_code[0] = response.status_code
+            return response
 
     # Register all routes
     _register_routes(app)
@@ -1066,16 +1176,19 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/graph",
         response_model=GraphDataResponse,
         summary="Get memory graph data",
-        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion). Limited to 1000 most recent items.",
+        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).",
         operation_id="get_graph",
         tags=["Memory"],
     )
     async def api_graph(
-        bank_id: str, type: str | None = None, request_context: RequestContext = Depends(get_request_context)
+        bank_id: str,
+        type: str | None = None,
+        limit: int = 1000,
+        request_context: RequestContext = Depends(get_request_context),
     ):
         """Get graph data from database, filtered by bank_id and optionally by type."""
         try:
-            data = await app.state.memory.get_graph_data(bank_id, type, request_context=request_context)
+            data = await app.state.memory.get_graph_data(bank_id, type, limit=limit, request_context=request_context)
             return data
         except (AuthenticationError, HTTPException):
             raise
@@ -1134,6 +1247,37 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/list: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get(
+        "/v1/default/banks/{bank_id}/memories/{memory_id}",
+        summary="Get memory unit",
+        description="Get a single memory unit by ID with all its metadata including entities and tags.",
+        operation_id="get_memory",
+        tags=["Memory"],
+    )
+    async def api_get_memory(
+        bank_id: str,
+        memory_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Get a single memory unit by ID."""
+        try:
+            data = await app.state.memory.get_memory_unit(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                request_context=request_context,
+            )
+            if data is None:
+                raise HTTPException(status_code=404, detail=f"Memory unit '{memory_id}' not found")
+            return data
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post(
         "/v1/default/banks/{bank_id}/memories/recall",
         response_model=RecallResponse,
@@ -1151,6 +1295,9 @@ def _register_routes(app: FastAPI):
         bank_id: str, request: RecallRequest, request_context: RequestContext = Depends(get_request_context)
     ):
         """Run a recall and return results with trace."""
+        import time
+
+        handler_start = time.time()
         metrics = get_metrics_collector()
 
         try:
@@ -1176,10 +1323,12 @@ def _register_routes(app: FastAPI):
             include_chunks = request.include.chunks is not None
             max_chunk_tokens = request.include.chunks.max_tokens if include_chunks else 8192
 
+            pre_recall = time.time() - handler_start
             # Run recall with tracing (record metrics)
             with metrics.record_operation(
-                "recall", bank_id=bank_id, budget=request.budget.value, max_tokens=request.max_tokens
+                "recall", bank_id=bank_id, source="api", budget=request.budget.value, max_tokens=request.max_tokens
             ):
+                recall_start = time.time()
                 core_result = await app.state.memory.recall_async(
                     bank_id=bank_id,
                     query=request.query,
@@ -1193,6 +1342,8 @@ def _register_routes(app: FastAPI):
                     include_chunks=include_chunks,
                     max_chunk_tokens=max_chunk_tokens,
                     request_context=request_context,
+                    tags=request.tags,
+                    tags_match=request.tags_match,
                 )
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
@@ -1208,6 +1359,7 @@ def _register_routes(app: FastAPI):
                     mentioned_at=fact.mentioned_at,
                     document_id=fact.document_id,
                     chunk_id=fact.chunk_id,
+                    tags=fact.tags,
                 )
                 for fact in core_result.results
             ]
@@ -1238,9 +1390,21 @@ def _register_routes(app: FastAPI):
                         ],
                     )
 
-            return RecallResponse(
+            response = RecallResponse(
                 results=recall_results, trace=core_result.trace, entities=entities_response, chunks=chunks_response
             )
+
+            handler_duration = time.time() - handler_start
+            recall_duration = time.time() - recall_start
+            post_recall = handler_duration - pre_recall - recall_duration
+            if handler_duration > 1.0:
+                logging.info(
+                    f"[RECALL HTTP] bank={bank_id} handler_total={handler_duration:.3f}s "
+                    f"pre={pre_recall:.3f}s recall={recall_duration:.3f}s post={post_recall:.3f}s "
+                    f"results={len(recall_results)} entities={len(entities_response) if entities_response else 0}"
+                )
+
+            return response
         except HTTPException:
             raise
         except OperationValidationError as e:
@@ -1250,8 +1414,11 @@ def _register_routes(app: FastAPI):
         except Exception as e:
             import traceback
 
+            handler_duration = time.time() - handler_start
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            logger.error(f"Error in /v1/default/banks/{bank_id}/memories/recall: {error_detail}")
+            logger.error(
+                f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
+            )
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
@@ -1276,7 +1443,7 @@ def _register_routes(app: FastAPI):
 
         try:
             # Use the memory system's reflect_async method (record metrics)
-            with metrics.record_operation("reflect", bank_id=bank_id, budget=request.budget.value):
+            with metrics.record_operation("reflect", bank_id=bank_id, source="api", budget=request.budget.value):
                 core_result = await app.state.memory.reflect_async(
                     bank_id=bank_id,
                     query=request.query,
@@ -1285,6 +1452,8 @@ def _register_routes(app: FastAPI):
                     max_tokens=request.max_tokens,
                     response_schema=request.response_schema,
                     request_context=request_context,
+                    tags=request.tags,
+                    tags_match=request.tags_match,
                 )
 
             # Convert core MemoryFact objects to API ReflectFact objects if facts are requested
@@ -1351,9 +1520,14 @@ def _register_routes(app: FastAPI):
         operation_id="get_agent_stats",
         tags=["Banks"],
     )
-    async def api_stats(bank_id: str):
+    async def api_stats(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
         """Get statistics about memory nodes and links for a memory bank."""
         try:
+            # Authenticate and set tenant schema
+            await app.state.memory._authenticate_tenant(request_context)
             pool = await app.state.memory._get_pool()
             async with acquire_with_retry(pool) as conn:
                 # Get node counts by fact_type
@@ -1472,19 +1646,27 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/entities",
         response_model=EntityListResponse,
         summary="List entities",
-        description="List all entities (people, organizations, etc.) known by the bank, ordered by mention count.",
+        description="List all entities (people, organizations, etc.) known by the bank, ordered by mention count. Supports pagination.",
         operation_id="list_entities",
         tags=["Entities"],
     )
     async def api_list_entities(
         bank_id: str,
         limit: int = Query(default=100, description="Maximum number of entities to return"),
+        offset: int = Query(default=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
-        """List entities for a memory bank."""
+        """List entities for a memory bank with pagination."""
         try:
-            entities = await app.state.memory.list_entities(bank_id, limit=limit, request_context=request_context)
-            return EntityListResponse(items=[EntityListItem(**e) for e in entities])
+            data = await app.state.memory.list_entities(
+                bank_id, limit=limit, offset=offset, request_context=request_context
+            )
+            return EntityListResponse(
+                items=[EntityListItem(**e) for e in data["items"]],
+                total=data["total"],
+                limit=data["limit"],
+                offset=data["offset"],
+            )
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -1654,6 +1836,59 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/documents/{document_id}: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/tags",
+        response_model=ListTagsResponse,
+        summary="List tags",
+        description="List all unique tags in a memory bank with usage counts. "
+        "Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.",
+        operation_id="list_tags",
+        tags=["Memory"],
+    )
+    async def api_list_tags(
+        bank_id: str,
+        q: str | None = Query(
+            default=None,
+            description="Wildcard pattern to filter tags (e.g., 'user:*' for user:alice, '*-admin' for role-admin). "
+            "Use '*' as wildcard. Case-insensitive.",
+        ),
+        limit: int = Query(default=100, description="Maximum number of tags to return"),
+        offset: int = Query(default=0, description="Offset for pagination"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """
+        List all unique tags in a memory bank.
+
+        Use this endpoint to discover available tags or expand wildcard patterns.
+        Supports '*' wildcards for flexible matching (case-insensitive):
+        - 'user:*' matches user:alice, user:bob
+        - '*-admin' matches role-admin, super-admin
+        - 'env*-prod' matches env-prod, environment-prod
+
+        Args:
+            bank_id: Memory Bank ID (from path)
+            q: Wildcard pattern to filter tags (use '*' as wildcard)
+            limit: Maximum number of tags to return (default: 100)
+            offset: Offset for pagination (default: 0)
+        """
+        try:
+            data = await app.state.memory.list_tags(
+                bank_id=bank_id,
+                pattern=q,
+                limit=limit,
+                offset=offset,
+                request_context=request_context,
+            )
+            return data
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/tags: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(
@@ -2018,24 +2253,33 @@ def _register_routes(app: FastAPI):
                     content_dict["document_id"] = item.document_id
                 if item.entities:
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
+                if item.tags:
+                    content_dict["tags"] = item.tags
                 contents.append(content_dict)
 
             if request.async_:
                 # Async processing: queue task and return immediately
-                result = await app.state.memory.submit_async_retain(bank_id, contents, request_context=request_context)
+                result = await app.state.memory.submit_async_retain(
+                    bank_id, contents, document_tags=request.document_tags, request_context=request_context
+                )
                 return RetainResponse.model_validate(
                     {
                         "success": True,
                         "bank_id": bank_id,
                         "items_count": result["items_count"],
                         "async": True,
+                        "operation_id": result["operation_id"],
                     }
                 )
             else:
                 # Synchronous processing: wait for completion (record metrics)
-                with metrics.record_operation("retain", bank_id=bank_id):
+                with metrics.record_operation("retain", bank_id=bank_id, source="api"):
                     result, usage = await app.state.memory.retain_batch_async(
-                        bank_id=bank_id, contents=contents, request_context=request_context, return_usage=True
+                        bank_id=bank_id,
+                        contents=contents,
+                        document_tags=request.document_tags,
+                        request_context=request_context,
+                        return_usage=True,
                     )
 
                 return RetainResponse.model_validate(

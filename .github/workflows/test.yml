@@ -222,7 +222,7 @@ jobs:
 
     - name: Install API dependencies
       working-directory: ./hindsight-api
-      run: uv sync --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Create .env file
       run: |
@@ -325,6 +325,7 @@ jobs:
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
       HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       HINDSIGHT_API_LLM_MODEL: openai/gpt-oss-20b
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -351,7 +352,7 @@ jobs:
 
     - name: Install dependencies
       working-directory: ./hindsight-api
-      run: uv sync --extra test --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --extra test --no-install-project --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
       uses: actions/cache@v4
@@ -412,11 +413,11 @@ jobs:
 
     - name: Install client test dependencies
       working-directory: ./hindsight-clients/python
-      run: uv sync --extra test --index-strategy unsafe-best-match
+      run: uv sync --frozen --extra test --index-strategy unsafe-best-match
 
     - name: Install API dependencies
       working-directory: ./hindsight-api
-      run: uv sync --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Create .env file
       run: |
@@ -489,7 +490,7 @@ jobs:
 
     - name: Install API dependencies
       working-directory: ./hindsight-api
-      run: uv sync --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Install TypeScript client dependencies
       working-directory: ./hindsight-clients/typescript
@@ -577,7 +578,7 @@ jobs:
 
     - name: Install API dependencies
       working-directory: ./hindsight-api
-      run: uv sync --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Create .env file
       run: |
@@ -644,11 +645,11 @@ jobs:
 
     - name: Install API dependencies
       working-directory: ./hindsight-api
-      run: uv sync --no-install-project --index-strategy unsafe-best-match
+      run: uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Install integration test dependencies
       working-directory: ./hindsight-integration-tests
-      run: uv sync
+      run: uv sync --frozen
 
     - name: Cache HuggingFace models
       uses: actions/cache@v4
@@ -728,7 +729,7 @@ jobs:
 
     - name: Install dependencies
       working-directory: ./hindsight-integrations/litellm
-      run: uv sync --extra dev
+      run: uv sync --frozen --extra dev
 
     - name: Run tests
       working-directory: ./hindsight-integrations/litellm
@@ -759,7 +760,7 @@ jobs:
 
     - name: Install dependencies
       working-directory: ./hindsight-embed
-      run: uv sync --index-strategy unsafe-best-match
+      run: uv sync --frozen --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
       uses: actions/cache@v4
@@ -819,11 +820,11 @@ jobs:
       working-directory: ./hindsight-api
       run: |
         uv build
-        uv sync --no-install-project --index-strategy unsafe-best-match
+        uv sync --frozen --no-install-project --index-strategy unsafe-best-match
 
     - name: Install Python client dependencies
       working-directory: ./hindsight-clients/python
-      run: uv sync --extra test --index-strategy unsafe-best-match
+      run: uv sync --frozen --extra test --index-strategy unsafe-best-match
 
     - name: Install TypeScript client
       run: |
@@ -927,9 +928,9 @@ jobs:
 
     - name: Install Python dependencies
       run: |
-        cd hindsight-dev && uv sync --index-strategy unsafe-best-match
-        cd ../hindsight-api && uv sync --index-strategy unsafe-best-match
-        cd ../hindsight-embed && uv sync --index-strategy unsafe-best-match
+        cd hindsight-dev && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-api && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-embed && uv sync --frozen --index-strategy unsafe-best-match
 
     - name: Run generate-openapi
       run: ./scripts/generate-openapi.sh

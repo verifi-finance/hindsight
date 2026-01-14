@@ -52,6 +52,9 @@ export function DataView({ factType }: DataViewProps) {
   const [selectedTableMemory, setSelectedTableMemory] = useState<any>(null);
   const itemsPerPage = 100;
 
+  // Fetch limit state - how many memories to load from the API
+  const [fetchLimit, setFetchLimit] = useState(1000);
+
   // Graph controls state
   const [showLabels, setShowLabels] = useState(true);
   const [maxNodes, setMaxNodes] = useState<number | undefined>(undefined);
@@ -93,7 +96,7 @@ export function DataView({ factType }: DataViewProps) {
     }
   };
 
-  const loadData = async () => {
+  const loadData = async (limit?: number) => {
     if (!currentBank) return;
 
     setLoading(true);
@@ -101,6 +104,7 @@ export function DataView({ factType }: DataViewProps) {
       const graphData: any = await client.getGraph({
         bank_id: currentBank,
         type: factType,
+        limit: limit ?? fetchLimit,
       });
       setData(graphData);
     } catch (error) {
@@ -265,9 +269,25 @@ export function DataView({ factType }: DataViewProps) {
 
           <div className="flex items-center justify-between mb-6">
             <div className="text-sm text-muted-foreground">
-              {searchQuery
-                ? `${filteredTableRows.length} of ${data.total_units} memories`
-                : `${data.total_units} total memories`}
+              {searchQuery ? (
+                `${filteredTableRows.length} of ${data.table_rows?.length ?? 0} loaded memories`
+              ) : data.table_rows?.length < data.total_units ? (
+                <span>
+                  Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
+                  <button
+                    onClick={() => {
+                      const newLimit = Math.min(data.total_units, fetchLimit + 1000);
+                      setFetchLimit(newLimit);
+                      loadData(newLimit);
+                    }}
+                    className="ml-2 text-primary hover:underline"
+                  >
+                    Load more
+                  </button>
+                </span>
+              ) : (
+                `${data.total_units} total memories`
+              )}
             </div>
             <div className="flex items-center gap-2 bg-muted rounded-lg p-1">
               <button
@@ -342,6 +362,7 @@ export function DataView({ factType }: DataViewProps) {
                       memory={selectedGraphNode}
                       onClose={() => setSelectedGraphNode(null)}
                       inPanel
+                      bankId={currentBank || undefined}
                     />
                   ) : (
                     /* Legend & Controls View */
@@ -718,13 +739,20 @@ export function DataView({ factType }: DataViewProps) {
                     memory={selectedTableMemory}
                     onClose={() => setSelectedTableMemory(null)}
                     inPanel
+                    bankId={currentBank || undefined}
                   />
                 </div>
               )}
             </div>
           )}
 
-          {viewMode === "timeline" && <TimelineView data={data} filteredRows={filteredTableRows} />}
+          {viewMode === "timeline" && (
+            <TimelineView
+              data={data}
+              filteredRows={filteredTableRows}
+              bankId={currentBank || undefined}
+            />
+          )}
         </>
       ) : (
         <div className="flex items-center justify-center py-20">
@@ -741,7 +769,15 @@ export function DataView({ factType }: DataViewProps) {
 // Timeline View Component - Custom compact timeline with zoom and navigation
 type Granularity = "year" | "month" | "week" | "day";
 
-function TimelineView({ data, filteredRows }: { data: any; filteredRows: any[] }) {
+function TimelineView({
+  data,
+  filteredRows,
+  bankId,
+}: {
+  data: any;
+  filteredRows: any[];
+  bankId?: string;
+}) {
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [granularity, setGranularity] = useState<Granularity>("month");
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -1094,7 +1130,12 @@ function TimelineView({ data, filteredRows }: { data: any; filteredRows: any[] }
       {/* Detail Panel - Fixed on Right */}
       {selectedItem && (
         <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l-2 border-primary shadow-2xl z-50 overflow-y-auto animate-in slide-in-from-right duration-300 ease-out">
-          <MemoryDetailPanel memory={selectedItem} onClose={() => setSelectedItem(null)} inPanel />
+          <MemoryDetailPanel
+            memory={selectedItem}
+            onClose={() => setSelectedItem(null)}
+            inPanel
+            bankId={bankId}
+          />
         </div>
       )}
     </div>

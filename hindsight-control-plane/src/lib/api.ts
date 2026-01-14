@@ -53,6 +53,8 @@ export class ControlPlaneClient {
       chunks?: { max_tokens: number } | null;
     };
     query_timestamp?: string;
+    tags?: string[];
+    tags_match?: "any" | "all" | "any_strict" | "all_strict";
   }) {
     return this.fetchApi("/api/recall", {
       method: "POST",
@@ -69,6 +71,8 @@ export class ControlPlaneClient {
     budget?: string;
     context?: string;
     include_facts?: boolean;
+    tags?: string[];
+    tags_match?: "any" | "all" | "any_strict" | "all_strict";
   }) {
     return this.fetchApi("/api/reflect", {
       method: "POST",
@@ -109,10 +113,11 @@ export class ControlPlaneClient {
   /**
    * Get graph data
    */
-  async getGraph(params: { bank_id: string; type?: string }) {
+  async getGraph(params: { bank_id: string; type?: string; limit?: number }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.type) queryParams.append("type", params.type);
+    if (params.limit) queryParams.append("limit", params.limit.toString());
     return this.fetchApi(`/api/graph?${queryParams}`);
   }
 
@@ -126,11 +131,17 @@ export class ControlPlaneClient {
   /**
    * List entities
    */
-  async listEntities(params: { bank_id: string; limit?: number }) {
+  async listEntities(params: { bank_id: string; limit?: number; offset?: number }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.limit) queryParams.append("limit", params.limit.toString());
-    return this.fetchApi(`/api/entities?${queryParams}`);
+    if (params.offset) queryParams.append("offset", params.offset.toString());
+    return this.fetchApi<{
+      items: any[];
+      total: number;
+      limit: number;
+      offset: number;
+    }>(`/api/entities?${queryParams}`);
   }
 
   /**
@@ -183,10 +194,43 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Delete an entire memory bank and all its data
+   */
+  async deleteBank(bankId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      deleted_count: number;
+    }>(`/api/banks/${bankId}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
    * Get chunk
    */
   async getChunk(chunkId: string) {
     return this.fetchApi(`/api/chunks/${chunkId}`);
+  }
+
+  /**
+   * Get a single memory by ID
+   */
+  async getMemory(memoryId: string, bankId: string) {
+    return this.fetchApi<{
+      id: string;
+      text: string;
+      context: string;
+      date: string;
+      type: string;
+      mentioned_at: string | null;
+      occurred_start: string | null;
+      occurred_end: string | null;
+      entities: string[];
+      document_id: string | null;
+      chunk_id: string | null;
+      tags: string[];
+    }>(`/api/memories/${memoryId}?bank_id=${bankId}`);
   }
 
   /**

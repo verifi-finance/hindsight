@@ -289,6 +289,7 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         fact_type: str | None = None,
+        limit: int = 1000,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """
@@ -297,10 +298,11 @@ class MemoryEngineInterface(ABC):
         Args:
             bank_id: The memory bank ID.
             fact_type: Filter by fact type.
+            limit: Maximum number of items to return (default: 1000).
             request_context: Request context for authentication.
 
         Returns:
-            Dict with nodes, edges, table_rows, total_units.
+            Dict with nodes, edges, table_rows, total_units, limit.
         """
         ...
 
@@ -404,18 +406,20 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         limit: int = 100,
+        offset: int = 0,
         request_context: "RequestContext",
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """
-        List entities for a bank.
+        List entities for a bank with pagination.
 
         Args:
             bank_id: The memory bank ID.
             limit: Maximum results.
+            offset: Offset for pagination.
             request_context: Request context for authentication.
 
         Returns:
-            List of entity dicts.
+            Dict with items, total, limit, offset.
         """
         ...
 

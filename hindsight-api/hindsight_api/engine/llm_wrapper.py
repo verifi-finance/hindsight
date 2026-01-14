@@ -88,9 +88,13 @@ class LLMProvider:
         self.groq_service_tier = groq_service_tier or os.getenv(ENV_LLM_GROQ_SERVICE_TIER, "auto")
 
         # Validate provider
-        valid_providers = ["openai", "groq", "ollama", "gemini", "anthropic", "lmstudio"]
+        valid_providers = ["openai", "groq", "ollama", "gemini", "anthropic", "lmstudio", "mock"]
         if self.provider not in valid_providers:
             raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
+
+        # Mock provider tracking (for testing)
+        self._mock_calls: list[dict] = []
+        self._mock_response: Any = None
 
         # Set default base URLs
         if not self.base_url:
@@ -101,8 +105,8 @@ class LLMProvider:
             elif self.provider == "lmstudio":
                 self.base_url = "http://localhost:1234/v1"
 
-        # Validate API key (not needed for ollama or lmstudio)
-        if self.provider not in ("ollama", "lmstudio") and not self.api_key:
+        # Validate API key (not needed for ollama, lmstudio, or mock)
+        if self.provider not in ("ollama", "lmstudio", "mock") and not self.api_key:
             raise ValueError(f"API key not found for {self.provider}")
 
         # Get timeout config (set HINDSIGHT_API_LLM_TIMEOUT for local LLMs that need longer timeouts)
@@ -113,7 +117,10 @@ class LLMProvider:
         self._gemini_client = None
         self._anthropic_client = None
 
-        if self.provider == "gemini":
+        if self.provider == "mock":
+            # Mock provider - no client needed
+            pass
+        elif self.provider == "gemini":
             self._gemini_client = genai.Client(api_key=self.api_key)
         elif self.provider == "anthropic":
             from anthropic import AsyncAnthropic
@@ -202,8 +209,19 @@ class LLMProvider:
             OutputTooLongError: If output exceeds token limits.
             Exception: Re-raises API errors after retries exhausted.
         """
+        queue_start_time = time.time()
         async with _global_llm_semaphore:
             start_time = time.time()
+            semaphore_wait_time = start_time - queue_start_time
+
+            # Handle Mock provider (for testing)
+            if self.provider == "mock":
+                return await self._call_mock(
+                    messages,
+                    response_format,
+                    scope,
+                    return_usage,
+                )
 
             # Handle Gemini provider separately
             if self.provider == "gemini":
@@ -215,7 +233,9 @@ class LLMProvider:
                     max_backoff,
                     skip_validation,
                     start_time,
+                    scope,
                     return_usage,
+                    semaphore_wait_time,
                 )
 
             # Handle Anthropic provider separately
@@ -229,7 +249,9 @@ class LLMProvider:
                     max_backoff,
                     skip_validation,
                     start_time,
+                    scope,
                     return_usage,
+                    semaphore_wait_time,
                 )
 
             # Handle Ollama with native API for structured output (better schema enforcement)
@@ -244,7 +266,9 @@ class LLMProvider:
                     max_backoff,
                     skip_validation,
                     start_time,
+                    scope,
                     return_usage,
+                    semaphore_wait_time,
                 )
 
             call_params = {
@@ -400,13 +424,17 @@ class LLMProvider:
                     output_tokens = usage.completion_tokens or 0 if usage else 0
                     total_tokens = usage.total_tokens or 0 if usage else 0
 
-                    if usage:
-                        get_metrics_collector().record_tokens(
-                            operation=scope,
-                            bank_id="llm",
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                        )
+                    # Record LLM metrics
+                    metrics = get_metrics_collector()
+                    metrics.record_llm_call(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        duration=duration,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        success=True,
+                    )
 
                     # Log slow calls
                     if duration > 10.0 and usage:
@@ -415,10 +443,11 @@ class LLMProvider:
                         if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
                             cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
                         cache_info = f", cached_tokens={cached_tokens}" if cached_tokens > 0 else ""
+                        wait_info = f", wait={semaphore_wait_time:.3f}s" if semaphore_wait_time > 0.1 else ""
                         logger.info(
-                            f"slow llm call: model={self.provider}/{self.model}, "
+                            f"slow llm call: scope={scope}, model={self.provider}/{self.model}, "
                             f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
-                            f"total_tokens={total_tokens}{cache_info}, time={duration:.3f}s, ratio out/in={ratio:.2f}"
+                            f"total_tokens={total_tokens}{cache_info}, time={duration:.3f}s{wait_info}, ratio out/in={ratio:.2f}"
                         )
 
                     if return_usage:
@@ -486,7 +515,9 @@ class LLMProvider:
         max_backoff: float,
         skip_validation: bool,
         start_time: float,
+        scope: str = "memory",
         return_usage: bool = False,
+        semaphore_wait_time: float = 0.0,
     ) -> Any:
         """Handle Anthropic-specific API calls."""
         from anthropic import APIConnectionError, APIStatusError, RateLimitError
@@ -559,26 +590,31 @@ class LLMProvider:
                 else:
                     result = content
 
-                # Record token usage metrics
+                # Record metrics and log slow calls
                 duration = time.time() - start_time
                 input_tokens = response.usage.input_tokens or 0 if response.usage else 0
                 output_tokens = response.usage.output_tokens or 0 if response.usage else 0
                 total_tokens = input_tokens + output_tokens
 
-                if response.usage:
-                    get_metrics_collector().record_tokens(
-                        operation="memory",
-                        bank_id="llm",
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                    )
+                # Record LLM metrics
+                metrics = get_metrics_collector()
+                metrics.record_llm_call(
+                    provider=self.provider,
+                    model=self.model,
+                    scope=scope,
+                    duration=duration,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    success=True,
+                )
 
                 # Log slow calls
-                if duration > 10.0 and response.usage:
+                if duration > 10.0:
+                    wait_info = f", wait={semaphore_wait_time:.3f}s" if semaphore_wait_time > 0.1 else ""
                     logger.info(
-                        f"slow llm call: model={self.provider}/{self.model}, "
+                        f"slow llm call: scope={scope}, model={self.provider}/{self.model}, "
                         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
-                        f"time={duration:.3f}s"
+                        f"time={duration:.3f}s{wait_info}"
                     )
 
                 if return_usage:
@@ -642,7 +678,9 @@ class LLMProvider:
         max_backoff: float,
         skip_validation: bool,
         start_time: float,
+        scope: str = "memory",
         return_usage: bool = False,
+        semaphore_wait_time: float = 0.0,
     ) -> Any:
         """
         Call Ollama using native API with JSON schema enforcement.
@@ -719,18 +757,22 @@ class LLMProvider:
 
                     # Extract token usage from Ollama response
                     # Ollama returns prompt_eval_count (input) and eval_count (output)
+                    duration = time.time() - start_time
                     input_tokens = result.get("prompt_eval_count", 0) or 0
                     output_tokens = result.get("eval_count", 0) or 0
                     total_tokens = input_tokens + output_tokens
 
-                    # Record to metrics
-                    if input_tokens > 0 or output_tokens > 0:
-                        get_metrics_collector().record_tokens(
-                            operation="memory",
-                            bank_id="llm",
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                        )
+                    # Record LLM metrics
+                    metrics = get_metrics_collector()
+                    metrics.record_llm_call(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        duration=duration,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        success=True,
+                    )
 
                     # Validate against Pydantic model or return raw JSON
                     if skip_validation:
@@ -788,7 +830,9 @@ class LLMProvider:
         max_backoff: float,
         skip_validation: bool,
         start_time: float,
+        scope: str = "memory",
         return_usage: bool = False,
+        semaphore_wait_time: float = 0.0,
     ) -> Any:
         """Handle Gemini-specific API calls."""
         # Convert OpenAI-style messages to Gemini format
@@ -865,7 +909,7 @@ class LLMProvider:
                 else:
                     result = content
 
-                # Record token usage metrics
+                # Record metrics and log slow calls
                 duration = time.time() - start_time
                 input_tokens = 0
                 output_tokens = 0
@@ -873,20 +917,27 @@ class LLMProvider:
                     usage = response.usage_metadata
                     input_tokens = usage.prompt_token_count or 0
                     output_tokens = usage.candidates_token_count or 0
-                    get_metrics_collector().record_tokens(
-                        operation="memory",
-                        bank_id="llm",
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                    )
 
-                    # Log slow calls
-                    if duration > 10.0:
-                        logger.info(
-                            f"slow llm call: model={self.provider}/{self.model}, "
-                            f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
-                            f"time={duration:.3f}s"
-                        )
+                # Record LLM metrics
+                metrics = get_metrics_collector()
+                metrics.record_llm_call(
+                    provider=self.provider,
+                    model=self.model,
+                    scope=scope,
+                    duration=duration,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    success=True,
+                )
+
+                # Log slow calls
+                if duration > 10.0 and input_tokens > 0:
+                    wait_info = f", wait={semaphore_wait_time:.3f}s" if semaphore_wait_time > 0.1 else ""
+                    logger.info(
+                        f"slow llm call: scope={scope}, model={self.provider}/{self.model}, "
+                        f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
+                        f"time={duration:.3f}s{wait_info}"
+                    )
 
                 if return_usage:
                     token_usage = TokenUsage(
@@ -935,6 +986,61 @@ class LLMProvider:
         if last_exception:
             raise last_exception
         raise RuntimeError("Gemini call failed after all retries")
+
+    async def _call_mock(
+        self,
+        messages: list[dict[str, str]],
+        response_format: Any | None,
+        scope: str,
+        return_usage: bool,
+    ) -> Any:
+        """
+        Handle mock provider calls for testing.
+
+        Records the call and returns a configurable mock response.
+        """
+        # Record the call for test verification
+        call_record = {
+            "provider": self.provider,
+            "model": self.model,
+            "messages": messages,
+            "response_format": response_format.__name__
+            if response_format and hasattr(response_format, "__name__")
+            else str(response_format),
+            "scope": scope,
+        }
+        self._mock_calls.append(call_record)
+        logger.debug(f"Mock LLM call recorded: scope={scope}, model={self.model}")
+
+        # Return mock response
+        if self._mock_response is not None:
+            result = self._mock_response
+        elif response_format is not None:
+            # Try to create a minimal valid instance of the response format
+            try:
+                # For Pydantic models, try to create with minimal valid data
+                result = {"mock": True}
+            except Exception:
+                result = {"mock": True}
+        else:
+            result = "mock response"
+
+        if return_usage:
+            token_usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+            return result, token_usage
+        return result
+
+    def set_mock_response(self, response: Any) -> None:
+        """Set the response to return from mock calls."""
+        self._mock_response = response
+
+    def get_mock_calls(self) -> list[dict]:
+        """Get the list of recorded mock calls."""
+        return self._mock_calls
+
+    def clear_mock_calls(self) -> None:
+        """Clear the recorded mock calls."""
+        self._mock_calls = []
 
     @classmethod
     def for_memory(cls) -> "LLMProvider":

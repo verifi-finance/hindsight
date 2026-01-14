@@ -250,11 +250,34 @@ async def test_full_api_workflow(api_client, test_bank_id):
     # 8. Test Entity Endpoints
     # ================================================================
 
-    # List entities
+    # List entities with pagination
     response = await api_client.get(f"/v1/default/banks/{test_bank_id}/entities")
     assert response.status_code == 200
     entities_data = response.json()
     assert "items" in entities_data
+    assert "total" in entities_data
+    assert "limit" in entities_data
+    assert "offset" in entities_data
+    assert entities_data["offset"] == 0
+    assert entities_data["limit"] == 100  # default limit
+
+    # Test pagination with custom limit and offset
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/entities?limit=5&offset=0")
+    assert response.status_code == 200
+    paginated_data = response.json()
+    assert paginated_data["limit"] == 5
+    assert paginated_data["offset"] == 0
+    assert len(paginated_data["items"]) <= 5
+
+    # Test offset
+    if entities_data["total"] > 1:
+        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/entities?limit=1&offset=1")
+        assert response.status_code == 200
+        offset_data = response.json()
+        assert offset_data["offset"] == 1
+        # With offset=1, we should get different entity than first one (if there are multiple)
+        if len(offset_data["items"]) > 0 and len(entities_data["items"]) > 1:
+            assert offset_data["items"][0]["id"] != entities_data["items"][0]["id"]
 
     # Get specific entity if any exist
     if len(entities_data['items']) > 0:
@@ -288,8 +311,9 @@ async def test_full_api_workflow(api_client, test_bank_id):
     # 10. Clean Up
     # ================================================================
 
-    # Note: No delete bank endpoint in API, so test data remains in DB
-    # Using timestamped bank IDs prevents conflicts between test runs
+    # Clean up the test bank (delete bank endpoint is tested separately)
+    response = await api_client.delete(f"/v1/default/banks/{test_bank_id}")
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -489,6 +513,87 @@ async def test_document_deletion_with_slashes_in_id(api_client):
 
 
 @pytest.mark.asyncio
+async def test_delete_bank(api_client):
+    """Test delete bank endpoint.
+
+    Workflow:
+    1. Create a bank by storing memories
+    2. Verify bank exists with data
+    3. Delete the bank
+    4. Verify bank and all data is deleted
+    """
+    test_bank_id = f"delete_bank_test_{datetime.now().timestamp()}"
+
+    # 1. Create bank by storing memories with a document
+    response = await api_client.post(
+        f"/v1/default/banks/{test_bank_id}/memories",
+        json={
+            "items": [
+                {
+                    "content": "Alice is a software engineer at TechCorp.",
+                    "context": "team info",
+                    "document_id": "team-doc-1",
+                },
+                {
+                    "content": "Bob is the CTO and leads the engineering team.",
+                    "context": "team info",
+                    "document_id": "team-doc-1",
+                },
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+    # 2. Verify bank exists with data
+    # Check profile
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/profile")
+    assert response.status_code == 200
+
+    # Check stats show data exists
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/stats")
+    assert response.status_code == 200
+    stats = response.json()
+    assert stats["total_nodes"] > 0
+
+    # Check documents exist
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/documents")
+    assert response.status_code == 200
+    assert len(response.json()["items"]) > 0
+
+    # Check bank is in list
+    response = await api_client.get("/v1/default/banks")
+    assert response.status_code == 200
+    bank_ids = [b["bank_id"] for b in response.json()["banks"]]
+    assert test_bank_id in bank_ids
+
+    # 3. Delete the bank
+    response = await api_client.delete(f"/v1/default/banks/{test_bank_id}")
+    assert response.status_code == 200
+    delete_result = response.json()
+    assert delete_result["success"] is True
+    assert delete_result["deleted_count"] > 0
+    assert "deleted successfully" in delete_result["message"]
+
+    # 4. Verify bank and all data is deleted
+    # Bank should not be in list
+    response = await api_client.get("/v1/default/banks")
+    assert response.status_code == 200
+    bank_ids = [b["bank_id"] for b in response.json()["banks"]]
+    assert test_bank_id not in bank_ids
+
+    # Stats should show zero data (profile auto-creates empty bank)
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/stats")
+    assert response.status_code == 200
+    stats = response.json()
+    assert stats["total_nodes"] == 0
+    assert stats["total_documents"] == 0
+
+    # Clean up the auto-created empty bank
+    await api_client.delete(f"/v1/default/banks/{test_bank_id}")
+
+
+@pytest.mark.asyncio
 async def test_async_retain(api_client):
     """Test asynchronous retain functionality.
 
@@ -581,11 +686,14 @@ async def test_async_retain_parallel(api_client):
     test_bank_id = f"async_parallel_test_{datetime.now().timestamp()}"
     num_documents = 5
 
-    # Prepare multiple documents to retain
+    # Prepare multiple documents to retain with realistic names
+    # Using realistic names instead of generic Person0, Company0 to ensure LLM extracts facts
+    people = ["Alice Smith", "Bob Johnson", "Carol Williams", "David Brown", "Emily Davis"]
+    companies = ["TechCorp", "DataSoft", "CloudBase", "NetWorks", "InfoSys"]
     documents = [
         {
-            "content": f"Document {i}: This is test content about Person{i} who works at Company{i}.",
-            "context": f"test document {i}",
+            "content": f"{people[i]} is a software engineer who works at {companies[i]} and specializes in Python development.",
+            "context": f"employee profile {i}",
             "document_id": f"doc_{i}"
         }
         for i in range(num_documents)

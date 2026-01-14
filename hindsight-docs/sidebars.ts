@@ -29,6 +29,11 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/multilingual',
+          label: 'Multilingual',
+        },
+        {
+          type: 'doc',
           id: 'developer/performance',
           label: 'Performance',
         },
@@ -128,8 +133,8 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
-          id: 'developer/metrics',
-          label: 'Metrics',
+          id: 'developer/monitoring',
+          label: 'Monitoring',
         },
         {
           type: 'doc',

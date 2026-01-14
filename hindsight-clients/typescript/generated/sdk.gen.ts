@@ -39,6 +39,9 @@ import type {
   GetGraphData,
   GetGraphErrors,
   GetGraphResponses,
+  GetMemoryData,
+  GetMemoryErrors,
+  GetMemoryResponses,
   HealthEndpointHealthGetData,
   HealthEndpointHealthGetResponses,
   ListBanksData,
@@ -56,6 +59,9 @@ import type {
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
+  ListTagsData,
+  ListTagsErrors,
+  ListTagsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
   RecallMemoriesData,
@@ -123,7 +129,7 @@ export const metricsEndpointMetricsGet = <ThrowOnError extends boolean = false>(
 /**
  * Get memory graph data
  *
- * Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion). Limited to 1000 most recent items.
+ * Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).
  */
 export const getGraph = <ThrowOnError extends boolean = false>(
   options: Options<GetGraphData, ThrowOnError>,
@@ -147,6 +153,20 @@ export const listMemories = <ThrowOnError extends boolean = false>(
     ListMemoriesErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/memories/list", ...options });
+
+/**
+ * Get memory unit
+ *
+ * Get a single memory unit by ID with all its metadata including entities and tags.
+ */
+export const getMemory = <ThrowOnError extends boolean = false>(
+  options: Options<GetMemoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetMemoryResponses,
+    GetMemoryErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/memories/{memory_id}", ...options });
 
 /**
  * Recall memory
@@ -236,7 +256,7 @@ export const getAgentStats = <ThrowOnError extends boolean = false>(
 /**
  * List entities
  *
- * List all entities (people, organizations, etc.) known by the bank, ordered by mention count.
+ * List all entities (people, organizations, etc.) known by the bank, ordered by mention count. Supports pagination.
  */
 export const listEntities = <ThrowOnError extends boolean = false>(
   options: Options<ListEntitiesData, ThrowOnError>,
@@ -328,6 +348,20 @@ export const getDocument = <ThrowOnError extends boolean = false>(
     GetDocumentErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}", ...options });
+
+/**
+ * List tags
+ *
+ * List all unique tags in a memory bank with usage counts. Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.
+ */
+export const listTags = <ThrowOnError extends boolean = false>(
+  options: Options<ListTagsData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListTagsResponses,
+    ListTagsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/tags", ...options });
 
 /**
  * Get chunk details

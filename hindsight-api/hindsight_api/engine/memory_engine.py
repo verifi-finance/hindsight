@@ -18,6 +18,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from ..config import get_config
+from ..metrics import get_metrics_collector
+from .db_budget import budgeted_operation
 
 # Context variable for current schema (async-safe, per-task isolation)
 _current_schema: contextvars.ContextVar[str] = contextvars.ContextVar("current_schema", default="public")
@@ -149,7 +151,8 @@ from .retain import bank_utils, embedding_utils
 from .retain.types import RetainContentDict
 from .search import observation_utils, think_utils
 from .search.reranking import CrossEncoderReranker
-from .task_backend import AsyncIOQueueBackend, TaskBackend
+from .search.tags import TagsMatch
+from .task_backend import AsyncIOQueueBackend, NoopTaskBackend, TaskBackend
 
 
 class Budget(str, Enum):
@@ -202,12 +205,25 @@ class MemoryEngine(MemoryEngineInterface):
         memory_llm_api_key: str | None = None,
         memory_llm_model: str | None = None,
         memory_llm_base_url: str | None = None,
+        # Per-operation LLM config (optional, falls back to memory_llm_* params)
+        retain_llm_provider: str | None = None,
+        retain_llm_api_key: str | None = None,
+        retain_llm_model: str | None = None,
+        retain_llm_base_url: str | None = None,
+        reflect_llm_provider: str | None = None,
+        reflect_llm_api_key: str | None = None,
+        reflect_llm_model: str | None = None,
+        reflect_llm_base_url: str | None = None,
         embeddings: Embeddings | None = None,
         cross_encoder: CrossEncoderModel | None = None,
         query_analyzer: QueryAnalyzer | None = None,
-        pool_min_size: int = 5,
-        pool_max_size: int = 100,
+        pool_min_size: int | None = None,
+        pool_max_size: int | None = None,
+        db_command_timeout: int | None = None,
+        db_acquire_timeout: int | None = None,
         task_backend: TaskBackend | None = None,
+        task_batch_size: int | None = None,
+        task_batch_interval: float | None = None,
         run_migrations: bool = True,
         operation_validator: "OperationValidatorExtension | None" = None,
         tenant_extension: "TenantExtension | None" = None,
@@ -227,12 +243,24 @@ class MemoryEngine(MemoryEngineInterface):
             memory_llm_api_key: API key for the LLM provider. Defaults to HINDSIGHT_API_LLM_API_KEY env var.
             memory_llm_model: Model name. Defaults to HINDSIGHT_API_LLM_MODEL env var.
             memory_llm_base_url: Base URL for the LLM API. Defaults based on provider.
+            retain_llm_provider: LLM provider for retain operations. Falls back to memory_llm_provider.
+            retain_llm_api_key: API key for retain LLM. Falls back to memory_llm_api_key.
+            retain_llm_model: Model for retain operations. Falls back to memory_llm_model.
+            retain_llm_base_url: Base URL for retain LLM. Falls back to memory_llm_base_url.
+            reflect_llm_provider: LLM provider for reflect operations. Falls back to memory_llm_provider.
+            reflect_llm_api_key: API key for reflect LLM. Falls back to memory_llm_api_key.
+            reflect_llm_model: Model for reflect operations. Falls back to memory_llm_model.
+            reflect_llm_base_url: Base URL for reflect LLM. Falls back to memory_llm_base_url.
             embeddings: Embeddings implementation. If not provided, created from env vars.
             cross_encoder: Cross-encoder model. If not provided, created from env vars.
             query_analyzer: Query analyzer implementation. If not provided, uses DateparserQueryAnalyzer.
-            pool_min_size: Minimum number of connections in the pool (default: 5)
-            pool_max_size: Maximum number of connections in the pool (default: 100)
+            pool_min_size: Minimum number of connections in the pool. Defaults to HINDSIGHT_API_DB_POOL_MIN_SIZE.
+            pool_max_size: Maximum number of connections in the pool. Defaults to HINDSIGHT_API_DB_POOL_MAX_SIZE.
+            db_command_timeout: PostgreSQL command timeout in seconds. Defaults to HINDSIGHT_API_DB_COMMAND_TIMEOUT.
+            db_acquire_timeout: Connection acquisition timeout in seconds. Defaults to HINDSIGHT_API_DB_ACQUIRE_TIMEOUT.
             task_backend: Custom task backend. If not provided, uses AsyncIOQueueBackend.
+            task_batch_size: Background task batch size. Defaults to HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_SIZE.
+            task_batch_interval: Background task batch interval in seconds. Defaults to HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_INTERVAL.
             run_migrations: Whether to run database migrations during initialize(). Default: True
             operation_validator: Optional extension to validate operations before execution.
                                 If provided, retain/recall/reflect operations will be validated.
@@ -259,8 +287,8 @@ class MemoryEngine(MemoryEngineInterface):
         db_url = db_url or config.database_url
         memory_llm_provider = memory_llm_provider or config.llm_provider
         memory_llm_api_key = memory_llm_api_key or config.llm_api_key
-        # Ollama doesn't require an API key
-        if not memory_llm_api_key and memory_llm_provider != "ollama":
+        # Ollama and mock don't require an API key
+        if not memory_llm_api_key and memory_llm_provider not in ("ollama", "mock"):
             raise ValueError("LLM API key is required. Set HINDSIGHT_API_LLM_API_KEY environment variable.")
         memory_llm_model = memory_llm_model or config.llm_model
         memory_llm_base_url = memory_llm_base_url or config.get_llm_base_url() or None
@@ -288,8 +316,10 @@ class MemoryEngine(MemoryEngineInterface):
         # Connection pool (will be created in initialize())
         self._pool = None
         self._initialized = False
-        self._pool_min_size = pool_min_size
-        self._pool_max_size = pool_max_size
+        self._pool_min_size = pool_min_size if pool_min_size is not None else config.db_pool_min_size
+        self._pool_max_size = pool_max_size if pool_max_size is not None else config.db_pool_max_size
+        self._db_command_timeout = db_command_timeout if db_command_timeout is not None else config.db_command_timeout
+        self._db_acquire_timeout = db_acquire_timeout if db_acquire_timeout is not None else config.db_acquire_timeout
         self._run_migrations = run_migrations
 
         # Initialize entity resolver (will be created in initialize())
@@ -309,7 +339,7 @@ class MemoryEngine(MemoryEngineInterface):
 
             self.query_analyzer = DateparserQueryAnalyzer()
 
-        # Initialize LLM configuration
+        # Initialize LLM configuration (default, used as fallback)
         self._llm_config = LLMConfig(
             provider=memory_llm_provider,
             api_key=memory_llm_api_key,
@@ -321,17 +351,68 @@ class MemoryEngine(MemoryEngineInterface):
         self._llm_client = self._llm_config._client
         self._llm_model = self._llm_config.model
 
+        # Initialize per-operation LLM configs (fall back to default if not specified)
+        # Retain LLM config - for fact extraction (benefits from strong structured output)
+        retain_provider = retain_llm_provider or config.retain_llm_provider or memory_llm_provider
+        retain_api_key = retain_llm_api_key or config.retain_llm_api_key or memory_llm_api_key
+        retain_model = retain_llm_model or config.retain_llm_model or memory_llm_model
+        retain_base_url = retain_llm_base_url or config.retain_llm_base_url or memory_llm_base_url
+        # Apply provider-specific base URL defaults for retain
+        if retain_base_url is None:
+            if retain_provider.lower() == "groq":
+                retain_base_url = "https://api.groq.com/openai/v1"
+            elif retain_provider.lower() == "ollama":
+                retain_base_url = "http://localhost:11434/v1"
+            else:
+                retain_base_url = ""
+
+        self._retain_llm_config = LLMConfig(
+            provider=retain_provider,
+            api_key=retain_api_key,
+            base_url=retain_base_url,
+            model=retain_model,
+        )
+
+        # Reflect LLM config - for think/observe operations (can use lighter models)
+        reflect_provider = reflect_llm_provider or config.reflect_llm_provider or memory_llm_provider
+        reflect_api_key = reflect_llm_api_key or config.reflect_llm_api_key or memory_llm_api_key
+        reflect_model = reflect_llm_model or config.reflect_llm_model or memory_llm_model
+        reflect_base_url = reflect_llm_base_url or config.reflect_llm_base_url or memory_llm_base_url
+        # Apply provider-specific base URL defaults for reflect
+        if reflect_base_url is None:
+            if reflect_provider.lower() == "groq":
+                reflect_base_url = "https://api.groq.com/openai/v1"
+            elif reflect_provider.lower() == "ollama":
+                reflect_base_url = "http://localhost:11434/v1"
+            else:
+                reflect_base_url = ""
+
+        self._reflect_llm_config = LLMConfig(
+            provider=reflect_provider,
+            api_key=reflect_api_key,
+            base_url=reflect_base_url,
+            model=reflect_model,
+        )
+
         # Initialize cross-encoder reranker (cached for performance)
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
 
         # Initialize task backend
-        self._task_backend = task_backend or AsyncIOQueueBackend(batch_size=100, batch_interval=1.0)
+        if task_backend:
+            self._task_backend = task_backend
+        elif config.task_backend == "noop":
+            self._task_backend = NoopTaskBackend()
+        else:
+            # Default to memory (AsyncIOQueueBackend)
+            _task_batch_size = task_batch_size if task_batch_size is not None else config.task_backend_memory_batch_size
+            _task_batch_interval = (
+                task_batch_interval if task_batch_interval is not None else config.task_backend_memory_batch_interval
+            )
+            self._task_backend = AsyncIOQueueBackend(batch_size=_task_batch_size, batch_interval=_task_batch_interval)
 
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
-        # Limit concurrent searches to prevent connection pool exhaustion
-        # Each search can use 2-4 connections, so with 10 concurrent searches
-        # we use ~20-40 connections max, staying well within pool limits
-        self._search_semaphore = asyncio.Semaphore(10)
+        # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
+        self._search_semaphore = asyncio.Semaphore(get_config().recall_max_concurrent)
 
         # Backpressure for put operations: limit concurrent puts to prevent database contention
         # Each put_batch holds a connection for the entire transaction, so we limit to 5
@@ -608,9 +689,27 @@ class MemoryEngine(MemoryEngineInterface):
             await loop.run_in_executor(None, self.query_analyzer.load)
 
         async def verify_llm():
-            """Verify LLM connection is working."""
+            """Verify LLM connections are working for all unique configs."""
             if not self._skip_llm_verification:
+                # Verify default config
                 await self._llm_config.verify_connection()
+                # Verify retain config if different from default
+                retain_is_different = (
+                    self._retain_llm_config.provider != self._llm_config.provider
+                    or self._retain_llm_config.model != self._llm_config.model
+                )
+                if retain_is_different:
+                    await self._retain_llm_config.verify_connection()
+                # Verify reflect config if different from default and retain
+                reflect_is_different = (
+                    self._reflect_llm_config.provider != self._llm_config.provider
+                    or self._reflect_llm_config.model != self._llm_config.model
+                ) and (
+                    self._reflect_llm_config.provider != self._retain_llm_config.provider
+                    or self._reflect_llm_config.model != self._retain_llm_config.model
+                )
+                if reflect_is_different:
+                    await self._reflect_llm_config.verify_connection()
 
         # Build list of initialization tasks
         init_tasks = [
@@ -652,9 +751,9 @@ class MemoryEngine(MemoryEngineInterface):
             self.db_url,
             min_size=self._pool_min_size,
             max_size=self._pool_max_size,
-            command_timeout=60,
+            command_timeout=self._db_command_timeout,
             statement_cache_size=0,  # Disable prepared statement cache
-            timeout=30,  # Connection acquisition timeout (seconds)
+            timeout=self._db_acquire_timeout,  # Connection acquisition timeout (seconds)
         )
 
         # Initialize entity resolver with pool
@@ -961,6 +1060,7 @@ class MemoryEngine(MemoryEngineInterface):
         document_id: str | None = None,
         fact_type_override: str | None = None,
         confidence_score: float | None = None,
+        document_tags: list[str] | None = None,
         return_usage: bool = False,
     ):
         """
@@ -1093,6 +1193,7 @@ class MemoryEngine(MemoryEngineInterface):
                     is_first_batch=i == 1,  # Only upsert on first batch
                     fact_type_override=fact_type_override,
                     confidence_score=confidence_score,
+                    document_tags=document_tags,
                 )
                 all_results.extend(sub_results)
                 total_usage = total_usage + sub_usage
@@ -1111,6 +1212,7 @@ class MemoryEngine(MemoryEngineInterface):
                 is_first_batch=True,
                 fact_type_override=fact_type_override,
                 confidence_score=confidence_score,
+                document_tags=document_tags,
             )
 
         # Call post-operation hook if validator is configured
@@ -1145,6 +1247,7 @@ class MemoryEngine(MemoryEngineInterface):
         is_first_batch: bool = True,
         fact_type_override: str | None = None,
         confidence_score: float | None = None,
+        document_tags: list[str] | None = None,
     ) -> tuple[list[list[str]], "TokenUsage"]:
         """
         Internal method for batch processing without chunking logic.
@@ -1161,6 +1264,7 @@ class MemoryEngine(MemoryEngineInterface):
             is_first_batch: Whether this is the first batch (for chunked operations, only delete on first batch)
             fact_type_override: Override fact type for all facts
             confidence_score: Confidence score for opinions
+            document_tags: Tags applied to all items in this batch
 
         Returns:
             Tuple of (unit ID lists, token usage for fact extraction)
@@ -1174,7 +1278,7 @@ class MemoryEngine(MemoryEngineInterface):
             return await orchestrator.retain_batch(
                 pool=pool,
                 embeddings_model=self.embeddings,
-                llm_config=self._llm_config,
+                llm_config=self._retain_llm_config,
                 entity_resolver=self.entity_resolver,
                 task_backend=self._task_backend,
                 format_date_fn=self._format_readable_date,
@@ -1185,6 +1289,7 @@ class MemoryEngine(MemoryEngineInterface):
                 is_first_batch=is_first_batch,
                 fact_type_override=fact_type_override,
                 confidence_score=confidence_score,
+                document_tags=document_tags,
             )
 
     def recall(
@@ -1243,6 +1348,8 @@ class MemoryEngine(MemoryEngineInterface):
         include_chunks: bool = False,
         max_chunk_tokens: int = 8192,
         request_context: "RequestContext",
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
     ) -> RecallResultModel:
         """
         Recall memories using N*4-way parallel retrieval (N fact types × 4 retrieval methods).
@@ -1268,6 +1375,8 @@ class MemoryEngine(MemoryEngineInterface):
             max_entity_tokens: Maximum tokens for entity observations (default 500)
             include_chunks: Whether to include raw chunks in the response
             max_chunk_tokens: Maximum tokens for chunks (default 8192)
+            tags: Optional list of tags for visibility filtering (OR matching - returns
+                  memories that have at least one matching tag)
 
         Returns:
             RecallResultModel containing:
@@ -1319,7 +1428,9 @@ class MemoryEngine(MemoryEngineInterface):
         # Backpressure: limit concurrent recalls to prevent overwhelming the database
         result = None
         error_msg = None
+        semaphore_wait_start = time.time()
         async with self._search_semaphore:
+            semaphore_wait = time.time() - semaphore_wait_start
             # Retry loop for connection errors
             max_retries = 3
             for attempt in range(max_retries + 1):
@@ -1337,6 +1448,9 @@ class MemoryEngine(MemoryEngineInterface):
                         include_chunks,
                         max_chunk_tokens,
                         request_context,
+                        semaphore_wait=semaphore_wait,
+                        tags=tags,
+                        tags_match=tags_match,
                     )
                     break  # Success - exit retry loop
                 except Exception as e:
@@ -1454,6 +1568,9 @@ class MemoryEngine(MemoryEngineInterface):
         include_chunks: bool = False,
         max_chunk_tokens: int = 8192,
         request_context: "RequestContext" = None,
+        semaphore_wait: float = 0.0,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -1483,7 +1600,9 @@ class MemoryEngine(MemoryEngineInterface):
         # Initialize tracer if requested
         from .search.tracer import SearchTracer
 
-        tracer = SearchTracer(query, thinking_budget, max_tokens) if enable_trace else None
+        tracer = (
+            SearchTracer(query, thinking_budget, max_tokens, tags=tags, tags_match=tags_match) if enable_trace else None
+        )
         if tracer:
             tracer.start()
 
@@ -1493,8 +1612,9 @@ class MemoryEngine(MemoryEngineInterface):
         # Buffer logs for clean output in concurrent scenarios
         recall_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}"
         log_buffer = []
+        tags_info = f", tags={tags}, tags_match={tags_match}" if tags else ""
         log_buffer.append(
-            f"[RECALL {recall_id}] Query: '{query[:50]}...' (budget={thinking_budget}, max_tokens={max_tokens})"
+            f"[RECALL {recall_id}] Query: '{query[:50]}...' (budget={thinking_budget}, max_tokens={max_tokens}{tags_info})"
         )
 
         try:
@@ -1508,37 +1628,67 @@ class MemoryEngine(MemoryEngineInterface):
                 tracer.record_query_embedding(query_embedding)
                 tracer.add_phase_metric("generate_query_embedding", step_duration)
 
-            # Step 2: N*4-Way Parallel Retrieval (N fact types × 4 retrieval methods)
+            # Step 2: Optimized parallel retrieval using batched queries
+            # - Semantic + BM25 combined in 1 CTE query for ALL fact types
+            # - Graph runs per fact type (complex traversal)
+            # - Temporal runs per fact type (if constraint detected)
             step_start = time.time()
             query_embedding_str = str(query_embedding)
 
-            from .search.retrieval import retrieve_parallel
+            from .search.retrieval import (
+                get_default_graph_retriever,
+                retrieve_all_fact_types_parallel,
+            )
 
             # Track each retrieval start time
             retrieval_start = time.time()
 
-            # Run retrieval for each fact type in parallel
-            retrieval_tasks = [
-                retrieve_parallel(
-                    pool, query, query_embedding_str, bank_id, ft, thinking_budget, question_date, self.query_analyzer
+            # Run optimized retrieval with connection budget
+            config = get_config()
+            async with budgeted_operation(
+                max_connections=config.recall_connection_budget,
+                operation_id=f"recall-{recall_id}",
+            ) as op:
+                budgeted_pool = op.wrap_pool(pool)
+                parallel_start = time.time()
+                multi_result = await retrieve_all_fact_types_parallel(
+                    budgeted_pool,
+                    query,
+                    query_embedding_str,
+                    bank_id,
+                    fact_type,  # Pass all fact types at once
+                    thinking_budget,
+                    question_date,
+                    self.query_analyzer,
+                    tags=tags,
+                    tags_match=tags_match,
                 )
-                for ft in fact_type
-            ]
-            all_retrievals = await asyncio.gather(*retrieval_tasks)
+                parallel_duration = time.time() - parallel_start
 
             # Combine all results from all fact types and aggregate timings
             semantic_results = []
             bm25_results = []
             graph_results = []
             temporal_results = []
-            aggregated_timings = {"semantic": 0.0, "bm25": 0.0, "graph": 0.0, "temporal": 0.0}
+            aggregated_timings = {
+                "semantic": 0.0,
+                "bm25": 0.0,
+                "graph": 0.0,
+                "temporal": 0.0,
+                "temporal_extraction": 0.0,
+            }
+            all_mpfp_timings = []
 
             detected_temporal_constraint = None
-            for idx, retrieval_result in enumerate(all_retrievals):
+            max_conn_wait = multi_result.max_conn_wait
+            for ft in fact_type:
+                retrieval_result = multi_result.results_by_fact_type.get(ft)
+                if not retrieval_result:
+                    continue
+
                 # Log fact types in this retrieval batch
-                ft_name = fact_type[idx] if idx < len(fact_type) else "unknown"
                 logger.debug(
-                    f"[RECALL {recall_id}] Fact type '{ft_name}': semantic={len(retrieval_result.semantic)}, bm25={len(retrieval_result.bm25)}, graph={len(retrieval_result.graph)}, temporal={len(retrieval_result.temporal) if retrieval_result.temporal else 0}"
+                    f"[RECALL {recall_id}] Fact type '{ft}': semantic={len(retrieval_result.semantic)}, bm25={len(retrieval_result.bm25)}, graph={len(retrieval_result.graph)}, temporal={len(retrieval_result.temporal) if retrieval_result.temporal else 0}"
                 )
 
                 semantic_results.extend(retrieval_result.semantic)
@@ -1552,6 +1702,8 @@ class MemoryEngine(MemoryEngineInterface):
                 # Capture temporal constraint (same across all fact types)
                 if retrieval_result.temporal_constraint:
                     detected_temporal_constraint = retrieval_result.temporal_constraint
+                # Collect MPFP timings
+                all_mpfp_timings.extend(retrieval_result.mpfp_timings)
 
             # If no temporal results from any fact type, set to None
             if not temporal_results:
@@ -1570,12 +1722,12 @@ class MemoryEngine(MemoryEngineInterface):
             retrieval_duration = time.time() - retrieval_start
 
             step_duration = time.time() - step_start
-            total_retrievals = len(fact_type) * (4 if temporal_results else 3)
-            # Format per-method timings
+            # Format per-method timings (these are the actual parallel retrieval times)
             timing_parts = [
                 f"semantic={len(semantic_results)}({aggregated_timings['semantic']:.3f}s)",
                 f"bm25={len(bm25_results)}({aggregated_timings['bm25']:.3f}s)",
                 f"graph={len(graph_results)}({aggregated_timings['graph']:.3f}s)",
+                f"temporal_extraction={aggregated_timings['temporal_extraction']:.3f}s",
             ]
             temporal_info = ""
             if detected_temporal_constraint:
@@ -1584,8 +1736,40 @@ class MemoryEngine(MemoryEngineInterface):
                 timing_parts.append(f"temporal={temporal_count}({aggregated_timings['temporal']:.3f}s)")
                 temporal_info = f" | temporal_range={start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}"
             log_buffer.append(
-                f"  [2] {total_retrievals}-way retrieval ({len(fact_type)} fact_types): {', '.join(timing_parts)} in {step_duration:.3f}s{temporal_info}"
+                f"  [2] Parallel retrieval ({len(fact_type)} fact_types): {', '.join(timing_parts)} in {parallel_duration:.3f}s{temporal_info}"
             )
+
+            # Log graph retriever timing breakdown if available
+            if all_mpfp_timings:
+                retriever_name = get_default_graph_retriever().name.upper()
+                mpfp_total = all_mpfp_timings[0]  # Take first fact type's timing as representative
+                mpfp_parts = [
+                    f"db_queries={mpfp_total.db_queries}",
+                    f"edge_load={mpfp_total.edge_load_time:.3f}s",
+                    f"edges={mpfp_total.edge_count}",
+                    f"patterns={mpfp_total.pattern_count}",
+                ]
+                if mpfp_total.seeds_time > 0.01:
+                    mpfp_parts.append(f"seeds={mpfp_total.seeds_time:.3f}s")
+                if mpfp_total.fusion > 0.001:
+                    mpfp_parts.append(f"fusion={mpfp_total.fusion:.3f}s")
+                if mpfp_total.fetch > 0.001:
+                    mpfp_parts.append(f"fetch={mpfp_total.fetch:.3f}s")
+                log_buffer.append(f"      [{retriever_name}] {', '.join(mpfp_parts)}")
+                # Log detailed hop timing for debugging slow queries
+                if mpfp_total.hop_details:
+                    for hd in mpfp_total.hop_details:
+                        log_buffer.append(
+                            f"        hop{hd['hop']}: exec={hd.get('exec_time', 0) * 1000:.0f}ms, "
+                            f"uncached={hd.get('uncached_after_filter', 0)}, "
+                            f"load={hd.get('load_time', 0) * 1000:.0f}ms, "
+                            f"edges={hd.get('edges_loaded', 0)}"
+                        )
+
+            # Record temporal constraint in tracer if detected
+            if tracer and detected_temporal_constraint:
+                start_dt, end_dt = detected_temporal_constraint
+                tracer.record_temporal_constraint(start_dt, end_dt)
 
             # Record retrieval results for tracer - per fact type
             if tracer:
@@ -1594,8 +1778,10 @@ class MemoryEngine(MemoryEngineInterface):
                     return [(r.id, r.__dict__) for r in results]
 
                 # Add retrieval results per fact type (to show parallel execution in UI)
-                for idx, rr in enumerate(all_retrievals):
-                    ft_name = fact_type[idx] if idx < len(fact_type) else "unknown"
+                for ft_name in fact_type:
+                    rr = multi_result.results_by_fact_type.get(ft_name)
+                    if not rr:
+                        continue
 
                     # Add semantic retrieval results for this fact type
                     tracer.add_retrieval_results(
@@ -1627,14 +1813,22 @@ class MemoryEngine(MemoryEngineInterface):
                         fact_type=ft_name,
                     )
 
-                    # Add temporal retrieval results for this fact type (even if empty, to show it ran)
-                    if rr.temporal is not None:
+                    # Add temporal retrieval results for this fact type
+                    # Show temporal even with 0 results if constraint was detected
+                    if rr.temporal is not None or rr.temporal_constraint is not None:
+                        temporal_metadata = {"budget": thinking_budget}
+                        if rr.temporal_constraint:
+                            start_dt, end_dt = rr.temporal_constraint
+                            temporal_metadata["constraint"] = {
+                                "start": start_dt.isoformat() if start_dt else None,
+                                "end": end_dt.isoformat() if end_dt else None,
+                            }
                         tracer.add_retrieval_results(
                             method_name="temporal",
-                            results=to_tuple_format(rr.temporal),
+                            results=to_tuple_format(rr.temporal or []),
                             duration_seconds=rr.timings.get("temporal", 0.0),
                             score_field="temporal_score",
-                            metadata={"budget": thinking_budget},
+                            metadata=temporal_metadata,
                             fact_type=ft_name,
                         )
 
@@ -1684,11 +1878,24 @@ class MemoryEngine(MemoryEngineInterface):
             # Ensure reranker is initialized (for lazy initialization mode)
             await reranker_instance.ensure_initialized()
 
+            # Pre-filter candidates to reduce reranking cost (RRF already provides good ranking)
+            # This is especially important for remote rerankers with network latency
+            reranker_max_candidates = get_config().reranker_max_candidates
+            pre_filtered_count = 0
+            if len(merged_candidates) > reranker_max_candidates:
+                # Sort by RRF score and take top candidates
+                merged_candidates.sort(key=lambda mc: mc.rrf_score, reverse=True)
+                pre_filtered_count = len(merged_candidates) - reranker_max_candidates
+                merged_candidates = merged_candidates[:reranker_max_candidates]
+
             # Rerank using cross-encoder
-            scored_results = reranker_instance.rerank(query, merged_candidates)
+            scored_results = await reranker_instance.rerank(query, merged_candidates)
 
             step_duration = time.time() - step_start
-            log_buffer.append(f"  [4] Reranking: {len(scored_results)} candidates scored in {step_duration:.3f}s")
+            pre_filter_note = f" (pre-filtered {pre_filtered_count})" if pre_filtered_count > 0 else ""
+            log_buffer.append(
+                f"  [4] Reranking: {len(scored_results)} candidates scored in {step_duration:.3f}s{pre_filter_note}"
+            )
 
             # Step 4.5: Combine cross-encoder score with retrieval signals
             # This preserves retrieval work (RRF, temporal, recency) instead of pure cross-encoder ranking
@@ -1738,9 +1945,6 @@ class MemoryEngine(MemoryEngineInterface):
 
                 # Re-sort by combined score
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
-                log_buffer.append(
-                    "  [4.6] Combined scoring: cross_encoder(0.6) + rrf(0.2) + temporal(0.1) + recency(0.1)"
-                )
 
             # Add reranked results to tracer AFTER combined scoring (so normalized values are included)
             if tracer:
@@ -1759,7 +1963,6 @@ class MemoryEngine(MemoryEngineInterface):
             # Step 5: Truncate to thinking_budget * 2 for token filtering
             rerank_limit = thinking_budget * 2
             top_scored = scored_results[:rerank_limit]
-            log_buffer.append(f"  [5] Truncated to top {len(top_scored)} results")
 
             # Step 6: Token budget filtering
             step_start = time.time()
@@ -1774,7 +1977,7 @@ class MemoryEngine(MemoryEngineInterface):
 
             step_duration = time.time() - step_start
             log_buffer.append(
-                f"  [6] Token filtering: {len(top_scored)} results, {total_tokens}/{max_tokens} tokens in {step_duration:.3f}s"
+                f"  [5] Token filtering: {len(top_scored)} results, {total_tokens}/{max_tokens} tokens in {step_duration:.3f}s"
             )
 
             if tracer:
@@ -1808,7 +2011,6 @@ class MemoryEngine(MemoryEngineInterface):
             visited_ids = list(set([sr.id for sr in scored_results[:50]]))  # Top 50
             if visited_ids:
                 await self._task_backend.submit_task({"type": "access_count_update", "node_ids": visited_ids})
-                log_buffer.append(f"  [7] Queued access count updates for {len(visited_ids)} nodes")
 
             # Log fact_type distribution in results
             fact_type_counts = {}
@@ -1841,6 +2043,7 @@ class MemoryEngine(MemoryEngineInterface):
                 top_results_dicts.append(result_dict)
 
             # Get entities for each fact if include_entities is requested
+            step_start = time.time()
             fact_entity_map = {}  # unit_id -> list of (entity_id, entity_name)
             if include_entities and top_scored:
                 unit_ids = [uuid.UUID(sr.id) for sr in top_scored]
@@ -1862,6 +2065,7 @@ class MemoryEngine(MemoryEngineInterface):
                             fact_entity_map[unit_id].append(
                                 {"entity_id": str(row["entity_id"]), "canonical_name": row["canonical_name"]}
                             )
+            entity_map_duration = time.time() - step_start
 
             # Convert results to MemoryFact objects
             memory_facts = []
@@ -1884,10 +2088,12 @@ class MemoryEngine(MemoryEngineInterface):
                         mentioned_at=result_dict.get("mentioned_at"),
                         document_id=result_dict.get("document_id"),
                         chunk_id=result_dict.get("chunk_id"),
+                        tags=result_dict.get("tags"),
                     )
                 )
 
             # Fetch entity observations if requested
+            step_start = time.time()
             entities_dict = None
             total_entity_tokens = 0
             total_chunk_tokens = 0
@@ -1908,7 +2114,13 @@ class MemoryEngine(MemoryEngineInterface):
                                 entities_ordered.append((entity_id, entity_name))
                                 seen_entity_ids.add(entity_id)
 
-                # Fetch observations for each entity (respect token budget, in order)
+                # Fetch all observations in a single batched query
+                entity_ids = [eid for eid, _ in entities_ordered]
+                all_observations = await self.get_entity_observations_batch(
+                    bank_id, entity_ids, limit_per_entity=5, request_context=request_context
+                )
+
+                # Build entities_dict respecting token budget, in relevance order
                 entities_dict = {}
                 encoding = _get_tiktoken_encoding()
 
@@ -1916,9 +2128,7 @@ class MemoryEngine(MemoryEngineInterface):
                     if total_entity_tokens >= max_entity_tokens:
                         break
 
-                    observations = await self.get_entity_observations(
-                        bank_id, entity_id, limit=5, request_context=request_context
-                    )
+                    observations = all_observations.get(entity_id, [])
 
                     # Calculate tokens for this entity's observations
                     entity_tokens = 0
@@ -1936,8 +2146,10 @@ class MemoryEngine(MemoryEngineInterface):
                             entity_id=entity_id, canonical_name=entity_name, observations=included_observations
                         )
                         total_entity_tokens += entity_tokens
+            entity_obs_duration = time.time() - step_start
 
             # Fetch chunks if requested
+            step_start = time.time()
             chunks_dict = None
             if include_chunks and top_scored:
                 from .response_models import ChunkInfo
@@ -1997,6 +2209,12 @@ class MemoryEngine(MemoryEngineInterface):
                                 chunk_text=chunk_text, chunk_index=row["chunk_index"], truncated=False
                             )
                             total_chunk_tokens += chunk_tokens
+            chunks_duration = time.time() - step_start
+
+            # Log entity/chunk fetch timing (only if any enrichment was requested)
+            log_buffer.append(
+                f"  [6] Response enrichment: entity_map={entity_map_duration:.3f}s, entity_obs={entity_obs_duration:.3f}s, chunks={chunks_duration:.3f}s"
+            )
 
             # Finalize trace if enabled
             trace_dict = None
@@ -2008,8 +2226,15 @@ class MemoryEngine(MemoryEngineInterface):
             total_time = time.time() - recall_start
             num_chunks = len(chunks_dict) if chunks_dict else 0
             num_entities = len(entities_dict) if entities_dict else 0
+            # Include wait times in log if significant
+            wait_parts = []
+            if semaphore_wait > 0.01:
+                wait_parts.append(f"sem={semaphore_wait:.3f}s")
+            if max_conn_wait > 0.01:
+                wait_parts.append(f"conn={max_conn_wait:.3f}s")
+            wait_info = f" | waits: {', '.join(wait_parts)}" if wait_parts else ""
             log_buffer.append(
-                f"[RECALL {recall_id}] Complete: {len(top_scored)} facts ({total_tokens} tok), {num_chunks} chunks ({total_chunk_tokens} tok), {num_entities} entities ({total_entity_tokens} tok) | {fact_type_summary} | {total_time:.3f}s"
+                f"[RECALL {recall_id}] Complete: {len(top_scored)} facts ({total_tokens} tok), {num_chunks} chunks ({total_chunk_tokens} tok), {num_entities} entities ({total_entity_tokens} tok) | {fact_type_summary} | {total_time:.3f}s{wait_info}"
             )
             logger.info("\n" + "\n".join(log_buffer))
 
@@ -2079,11 +2304,11 @@ class MemoryEngine(MemoryEngineInterface):
             doc = await conn.fetchrow(
                 f"""
                 SELECT d.id, d.bank_id, d.original_text, d.content_hash,
-                       d.created_at, d.updated_at, COUNT(mu.id) as unit_count
+                       d.created_at, d.updated_at, d.tags, COUNT(mu.id) as unit_count
                 FROM {fq_table("documents")} d
                 LEFT JOIN {fq_table("memory_units")} mu ON mu.document_id = d.id
                 WHERE d.id = $1 AND d.bank_id = $2
-                GROUP BY d.id, d.bank_id, d.original_text, d.content_hash, d.created_at, d.updated_at
+                GROUP BY d.id, d.bank_id, d.original_text, d.content_hash, d.created_at, d.updated_at, d.tags
                 """,
                 document_id,
                 bank_id,
@@ -2100,6 +2325,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "memory_unit_count": doc["unit_count"],
                 "created_at": doc["created_at"].isoformat() if doc["created_at"] else None,
                 "updated_at": doc["updated_at"].isoformat() if doc["updated_at"] else None,
+                "tags": list(doc["tags"]) if doc["tags"] else [],
             }
 
     async def delete_document(
@@ -2205,9 +2431,10 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
         pool = await self._get_pool()
         async with acquire_with_retry(pool) as conn:
-            # Ensure connection is not in read-only mode (can happen with connection poolers)
-            await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
             async with conn.transaction():
+                # Ensure transaction is not in read-only mode (can happen with connection poolers)
+                # Using SET LOCAL so it only affects this transaction, not the session
+                await conn.execute("SET LOCAL transaction_read_only TO off")
                 try:
                     if fact_type:
                         # Delete only memories of a specific fact type
@@ -2264,6 +2491,7 @@ class MemoryEngine(MemoryEngineInterface):
         bank_id: str | None = None,
         fact_type: str | None = None,
         *,
+        limit: int = 1000,
         request_context: "RequestContext",
     ):
         """
@@ -2272,10 +2500,11 @@ class MemoryEngine(MemoryEngineInterface):
         Args:
             bank_id: Filter by bank ID
             fact_type: Filter by fact type (world, experience, opinion)
+            limit: Maximum number of items to return (default: 1000)
             request_context: Request context for authentication.
 
         Returns:
-            Dict with nodes, edges, and table_rows
+            Dict with nodes, edges, table_rows, total_units, and limit
         """
         await self._authenticate_tenant(request_context)
         pool = await self._get_pool()
@@ -2297,15 +2526,29 @@ class MemoryEngine(MemoryEngineInterface):
 
             where_clause = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
 
+            # Get total count first
+            total_count_result = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*) as total
+                FROM {fq_table("memory_units")}
+                {where_clause}
+            """,
+                *query_params,
+            )
+            total_count = total_count_result["total"] if total_count_result else 0
+
+            # Get units with limit
+            param_count += 1
             units = await conn.fetch(
                 f"""
                 SELECT id, text, event_date, context, occurred_start, occurred_end, mentioned_at, document_id, chunk_id, fact_type
                 FROM {fq_table("memory_units")}
                 {where_clause}
                 ORDER BY mentioned_at DESC NULLS LAST, event_date DESC
-                LIMIT 1000
+                LIMIT ${param_count}
             """,
                 *query_params,
+                limit,
             )
 
             # Get links, filtering to only include links between units of the selected agent
@@ -2442,7 +2685,7 @@ class MemoryEngine(MemoryEngineInterface):
                 }
             )
 
-        return {"nodes": nodes, "edges": edges, "table_rows": table_rows, "total_units": len(units)}
+        return {"nodes": nodes, "edges": edges, "table_rows": table_rows, "total_units": total_count, "limit": limit}
 
     async def list_memory_units(
         self,
@@ -2570,6 +2813,68 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
             return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    async def get_memory_unit(
+        self,
+        bank_id: str,
+        memory_id: str,
+        request_context: "RequestContext",
+    ):
+        """
+        Get a single memory unit by ID.
+
+        Args:
+            bank_id: Bank ID
+            memory_id: Memory unit ID
+            request_context: Request context for authentication.
+
+        Returns:
+            Dict with memory unit data or None if not found
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            # Get the memory unit
+            row = await conn.fetchrow(
+                f"""
+                SELECT id, text, context, event_date, occurred_start, occurred_end,
+                       mentioned_at, fact_type, document_id, chunk_id, tags
+                FROM {fq_table("memory_units")}
+                WHERE id = $1 AND bank_id = $2
+                """,
+                memory_id,
+                bank_id,
+            )
+
+            if not row:
+                return None
+
+            # Get entity information
+            entities_rows = await conn.fetch(
+                f"""
+                SELECT e.canonical_name
+                FROM {fq_table("unit_entities")} ue
+                JOIN {fq_table("entities")} e ON ue.entity_id = e.id
+                WHERE ue.unit_id = $1
+                """,
+                row["id"],
+            )
+            entities = [r["canonical_name"] for r in entities_rows]
+
+            return {
+                "id": str(row["id"]),
+                "text": row["text"],
+                "context": row["context"] if row["context"] else "",
+                "date": row["event_date"].isoformat() if row["event_date"] else "",
+                "type": row["fact_type"],
+                "mentioned_at": row["mentioned_at"].isoformat() if row["mentioned_at"] else None,
+                "occurred_start": row["occurred_start"].isoformat() if row["occurred_start"] else None,
+                "occurred_end": row["occurred_end"].isoformat() if row["occurred_end"] else None,
+                "entities": entities,
+                "document_id": row["document_id"] if row["document_id"] else None,
+                "chunk_id": str(row["chunk_id"]) if row["chunk_id"] else None,
+                "tags": row["tags"] if row["tags"] else [],
+            }
 
     async def list_documents(
         self,
@@ -2805,7 +3110,7 @@ Guidelines:
 - Small changes in confidence are normal; large jumps should be rare"""
 
         try:
-            result = await self._llm_config.call(
+            result = await self._reflect_llm_config.call(
                 messages=[
                     {"role": "system", "content": "You evaluate and update opinions based on new information."},
                     {"role": "user", "content": evaluation_prompt},
@@ -2915,7 +3220,7 @@ Guidelines:
                     return
 
                 # Use cached LLM config
-                if self._llm_config is None:
+                if self._reflect_llm_config is None:
                     logger.error("[REINFORCE] LLM config not available, skipping opinion reinforcement")
                     return
 
@@ -3060,7 +3365,9 @@ Guidelines:
         """
         await self._authenticate_tenant(request_context)
         pool = await self._get_pool()
-        return await bank_utils.merge_bank_background(pool, self._llm_config, bank_id, new_info, update_disposition)
+        return await bank_utils.merge_bank_background(
+            pool, self._reflect_llm_config, bank_id, new_info, update_disposition
+        )
 
     async def list_banks(
         self,
@@ -3092,6 +3399,8 @@ Guidelines:
         max_tokens: int = 4096,
         response_schema: dict | None = None,
         request_context: "RequestContext",
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
     ) -> ReflectResult:
         """
         Reflect and formulate an answer using bank identity, world facts, and opinions.
@@ -3120,7 +3429,7 @@ Guidelines:
                 - structured_output: Optional dict if response_schema was provided
         """
         # Use cached LLM config
-        if self._llm_config is None:
+        if self._reflect_llm_config is None:
             raise ValueError("Memory LLM API key not set. Set HINDSIGHT_API_LLM_API_KEY environment variable.")
 
         # Authenticate tenant and set schema in context (for fq_table())
@@ -3146,16 +3455,22 @@ Guidelines:
 
         # Steps 1-3: Run multi-fact-type search (12-way retrieval: 4 methods × 3 fact types)
         recall_start = time.time()
-        search_result = await self.recall_async(
-            bank_id=bank_id,
-            query=query,
-            budget=budget,
-            max_tokens=4096,
-            enable_trace=False,
-            fact_type=["experience", "world", "opinion"],
-            include_entities=True,
-            request_context=request_context,
-        )
+        metrics = get_metrics_collector()
+        with metrics.record_operation(
+            "recall", bank_id=bank_id, source="reflect", budget=budget.value if budget else None
+        ):
+            search_result = await self.recall_async(
+                bank_id=bank_id,
+                query=query,
+                budget=budget,
+                max_tokens=4096,
+                enable_trace=False,
+                fact_type=["experience", "world", "opinion"],
+                include_entities=True,
+                request_context=request_context,
+                tags=tags,
+                tags_match=tags_match,
+            )
         recall_time = time.time() - recall_start
 
         all_results = search_result.results
@@ -3211,7 +3526,7 @@ Guidelines:
             response_format = JsonSchemaWrapper(response_schema)
 
         llm_start = time.time()
-        llm_result, usage = await self._llm_config.call(
+        llm_result, usage = await self._reflect_llm_config.call(
             messages=messages,
             scope="memory_reflect",
             max_completion_tokens=max_tokens,
@@ -3297,7 +3612,9 @@ Guidelines:
         """
         try:
             # Extract opinions from the answer
-            new_opinions = await think_utils.extract_opinions_from_text(self._llm_config, text=answer_text, query=query)
+            new_opinions = await think_utils.extract_opinions_from_text(
+                self._reflect_llm_config, text=answer_text, query=query
+            )
 
             # Store new opinions
             if new_opinions:
@@ -3368,37 +3685,110 @@ Guidelines:
                 observations.append(EntityObservation(text=row["text"], mentioned_at=mentioned_at))
             return observations
 
+    async def get_entity_observations_batch(
+        self,
+        bank_id: str,
+        entity_ids: list[str],
+        *,
+        limit_per_entity: int = 5,
+        request_context: "RequestContext",
+    ) -> dict[str, list[Any]]:
+        """
+        Get observations for multiple entities in a single query.
+
+        Args:
+            bank_id: bank IDentifier
+            entity_ids: List of entity UUIDs to get observations for
+            limit_per_entity: Maximum observations per entity
+            request_context: Request context for authentication.
+
+        Returns:
+            Dict mapping entity_id -> list of EntityObservation objects
+        """
+        if not entity_ids:
+            return {}
+
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            # Use window function to limit observations per entity
+            rows = await conn.fetch(
+                f"""
+                WITH ranked AS (
+                    SELECT
+                        ue.entity_id,
+                        mu.text,
+                        mu.mentioned_at,
+                        ROW_NUMBER() OVER (PARTITION BY ue.entity_id ORDER BY mu.mentioned_at DESC) as rn
+                    FROM {fq_table("memory_units")} mu
+                    JOIN {fq_table("unit_entities")} ue ON mu.id = ue.unit_id
+                    WHERE mu.bank_id = $1
+                      AND mu.fact_type = 'observation'
+                      AND ue.entity_id = ANY($2::uuid[])
+                )
+                SELECT entity_id, text, mentioned_at
+                FROM ranked
+                WHERE rn <= $3
+                ORDER BY entity_id, rn
+                """,
+                bank_id,
+                [uuid.UUID(eid) for eid in entity_ids],
+                limit_per_entity,
+            )
+
+            result: dict[str, list[Any]] = {eid: [] for eid in entity_ids}
+            for row in rows:
+                entity_id = str(row["entity_id"])
+                mentioned_at = row["mentioned_at"].isoformat() if row["mentioned_at"] else None
+                result[entity_id].append(EntityObservation(text=row["text"], mentioned_at=mentioned_at))
+            return result
+
     async def list_entities(
         self,
         bank_id: str,
         *,
         limit: int = 100,
+        offset: int = 0,
         request_context: "RequestContext",
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """
-        List all entities for a bank.
+        List all entities for a bank with pagination.
 
         Args:
             bank_id: bank IDentifier
             limit: Maximum number of entities to return
+            offset: Offset for pagination
             request_context: Request context for authentication.
 
         Returns:
-            List of entity dicts with id, canonical_name, mention_count, first_seen, last_seen
+            Dict with items, total, limit, offset
         """
         await self._authenticate_tenant(request_context)
         pool = await self._get_pool()
         async with acquire_with_retry(pool) as conn:
+            # Get total count
+            total_row = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*) as total
+                FROM {fq_table("entities")}
+                WHERE bank_id = $1
+                """,
+                bank_id,
+            )
+            total = total_row["total"] if total_row else 0
+
+            # Get paginated entities
             rows = await conn.fetch(
                 f"""
                 SELECT id, canonical_name, mention_count, first_seen, last_seen, metadata
                 FROM {fq_table("entities")}
                 WHERE bank_id = $1
-                ORDER BY mention_count DESC, last_seen DESC
-                LIMIT $2
+                ORDER BY mention_count DESC, last_seen DESC, id ASC
+                LIMIT $2 OFFSET $3
                 """,
                 bank_id,
                 limit,
+                offset,
             )
 
             entities = []
@@ -3425,7 +3815,91 @@ Guidelines:
                         "metadata": metadata,
                     }
                 )
-            return entities
+            return {
+                "items": entities,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+
+    async def list_tags(
+        self,
+        bank_id: str,
+        *,
+        pattern: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """
+        List all unique tags for a bank with usage counts.
+
+        Use this to discover available tags or expand wildcard patterns.
+        Supports '*' as wildcard for flexible matching (case-insensitive):
+        - 'user:*' matches user:alice, user:bob
+        - '*-admin' matches role-admin, super-admin
+        - 'env*-prod' matches env-prod, environment-prod
+
+        Args:
+            bank_id: Bank identifier
+            pattern: Wildcard pattern to filter tags (use '*' as wildcard, case-insensitive)
+            limit: Maximum number of tags to return
+            offset: Offset for pagination
+            request_context: Request context for authentication.
+
+        Returns:
+            Dict with items (list of {tag, count}), total, limit, offset
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+        async with acquire_with_retry(pool) as conn:
+            # Build pattern filter if provided (convert * to % for ILIKE)
+            pattern_clause = ""
+            params: list[Any] = [bank_id]
+            if pattern:
+                # Convert wildcard pattern: * -> % for SQL ILIKE
+                sql_pattern = pattern.replace("*", "%")
+                pattern_clause = "AND tag ILIKE $2"
+                params.append(sql_pattern)
+
+            # Get total count of distinct tags matching pattern
+            total_row = await conn.fetchrow(
+                f"""
+                SELECT COUNT(DISTINCT tag) as total
+                FROM {fq_table("memory_units")}, unnest(tags) AS tag
+                WHERE bank_id = $1 AND tags IS NOT NULL AND tags != '{{}}'
+                {pattern_clause}
+                """,
+                *params,
+            )
+            total = total_row["total"] if total_row else 0
+
+            # Get paginated tags with counts, ordered by frequency
+            limit_param = len(params) + 1
+            offset_param = len(params) + 2
+            params.extend([limit, offset])
+
+            rows = await conn.fetch(
+                f"""
+                SELECT tag, COUNT(*) as count
+                FROM {fq_table("memory_units")}, unnest(tags) AS tag
+                WHERE bank_id = $1 AND tags IS NOT NULL AND tags != '{{}}'
+                {pattern_clause}
+                GROUP BY tag
+                ORDER BY count DESC, tag ASC
+                LIMIT ${limit_param} OFFSET ${offset_param}
+                """,
+                *params,
+            )
+
+            items = [{"tag": row["tag"], "count": row["count"]} for row in rows]
+
+            return {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
 
     async def get_entity_state(
         self,
@@ -3548,7 +4022,9 @@ Guidelines:
             )
 
         # Step 3: Extract observations using LLM (no personality)
-        observations = await observation_utils.extract_observations_from_facts(self._llm_config, entity_name, facts)
+        observations = await observation_utils.extract_observations_from_facts(
+            self._reflect_llm_config, entity_name, facts
+        )
 
         if not observations:
             return []
@@ -4069,6 +4545,7 @@ Guidelines:
         contents: list[dict[str, Any]],
         *,
         request_context: "RequestContext",
+        document_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """Submit a batch retain operation to run asynchronously."""
         await self._authenticate_tenant(request_context)
@@ -4092,14 +4569,16 @@ Guidelines:
             )
 
         # Submit task to background queue
-        await self._task_backend.submit_task(
-            {
-                "type": "batch_retain",
-                "operation_id": str(operation_id),
-                "bank_id": bank_id,
-                "contents": contents,
-            }
-        )
+        task_payload = {
+            "type": "batch_retain",
+            "operation_id": str(operation_id),
+            "bank_id": bank_id,
+            "contents": contents,
+        }
+        if document_tags:
+            task_payload["document_tags"] = document_tags
+
+        await self._task_backend.submit_task(task_payload)
 
         logger.info(f"Retain task queued for bank_id={bank_id}, {len(contents)} items, operation_id={operation_id}")
 

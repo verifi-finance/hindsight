@@ -134,6 +134,8 @@ Hindsight is built for AI agents, not humans. Traditional search systems return 
 - `max_tokens`: How much memory content to return (default: 4096 tokens)
 - `budget`: Search depth level (low, mid, high)
 - `fact_type`: Filter by world, experience, opinion, or all
+- `tags`: Filter memories by tags
+- `tags_match`: How to match tags - `"any"` for OR (default), `"all"` for AND
 
 ### Expanding Context: Chunks and Entity Observations
 
@@ -226,6 +228,14 @@ Budget and max_tokens control different aspects of recall:
 | **Document Q&A** | mid | 4096 | Balanced coverage and speed |
 | **Research queries** | high | 8192 | Comprehensive, multi-hop reasoning |
 | **Real-time search** | low | 2048 | Minimize latency |
+
+---
+
+## Graph Retrieval Algorithms
+
+Hindsight supports multiple graph traversal algorithms. The default (`link_expansion`) is optimized for fast retrieval with target latency under 100ms.
+
+See [Configuration → Retrieval](./configuration#retrieval) for available algorithms and how to configure them.
 
 ---
 
