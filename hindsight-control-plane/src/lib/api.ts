@@ -51,6 +51,7 @@ export class ControlPlaneClient {
     include?: {
       entities?: { max_tokens: number } | null;
       chunks?: { max_tokens: number } | null;
+      mental_models?: { max_results?: number } | null;
     };
     query_timestamp?: string;
     tags?: string[];
@@ -123,10 +124,45 @@ export class ControlPlaneClient {
   }
 
   /**
-   * List operations
+   * List operations with optional filtering and pagination
    */
-  async listOperations(bankId: string) {
-    return this.fetchApi(`/api/operations/${bankId}`);
+  async listOperations(
+    bankId: string,
+    options?: { status?: string; limit?: number; offset?: number }
+  ) {
+    const params = new URLSearchParams();
+    if (options?.status) params.append("status", options.status);
+    if (options?.limit) params.append("limit", options.limit.toString());
+    if (options?.offset) params.append("offset", options.offset.toString());
+    const query = params.toString();
+    return this.fetchApi<{
+      bank_id: string;
+      total: number;
+      limit: number;
+      offset: number;
+      operations: Array<{
+        id: string;
+        task_type: string;
+        items_count: number;
+        document_id: string | null;
+        created_at: string;
+        status: string;
+        error_message: string | null;
+      }>;
+    }>(`/api/operations/${bankId}${query ? `?${query}` : ""}`);
+  }
+
+  /**
+   * Cancel a pending operation
+   */
+  async cancelOperation(bankId: string, operationId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      operation_id: string;
+    }>(`/api/operations/${bankId}?operation_id=${operationId}`, {
+      method: "DELETE",
+    });
   }
 
   /**
@@ -208,6 +244,34 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Clear all mental models for a bank
+   */
+  async clearMentalModels(bankId: string) {
+    return this.fetchApi<{
+      success: boolean;
+      message: string;
+      deleted_count: number;
+    }>(`/api/banks/${bankId}/mental-models`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Trigger consolidation for a bank
+   */
+  async triggerConsolidation(bankId: string) {
+    return this.fetchApi<{
+      status: string;
+      processed: number;
+      created: number;
+      updated: number;
+      message: string;
+    }>(`/api/banks/${bankId}/consolidate`, {
+      method: "POST",
+    });
+  }
+
+  /**
    * Get chunk
    */
   async getChunk(chunkId: string) {
@@ -262,49 +326,114 @@ export class ControlPlaneClient {
   }
 
   /**
-   * List mental models for a bank
+   * List directives for a bank
    */
-  async listMentalModels(bankId: string) {
+  async listDirectives(bankId: string, tags?: string[], tagsMatch?: string) {
+    const params = new URLSearchParams();
+    if (tags && tags.length > 0) {
+      tags.forEach((t) => params.append("tags", t));
+    }
+    if (tagsMatch) {
+      params.append("tags_match", tagsMatch);
+    }
+    const query = params.toString();
     return this.fetchApi<{
       items: Array<{
         id: string;
         bank_id: string;
-        subtype: string;
         name: string;
-        description: string;
-        observations?: Array<{ title: string; text: string; based_on: string[] }>;
-        entity_id: string | null;
-        links: string[];
-        tags?: string[];
-        last_updated: string | null;
+        content: string;
+        priority: number;
+        is_active: boolean;
+        tags: string[];
         created_at: string;
+        updated_at: string;
       }>;
-    }>(`/api/banks/${bankId}/mental-models`);
+    }>(`/api/banks/${bankId}/directives${query ? `?${query}` : ""}`);
   }
 
   /**
-   * Refresh mental models for a bank (async)
-   * @param subtype - Optional subtype to refresh. If not specified, refreshes all.
+   * Create a directive
    */
-  async refreshMentalModels(
+  async createDirective(
     bankId: string,
-    subtype?: "structural" | "emergent" | "pinned" | "learned"
+    params: {
+      name: string;
+      content: string;
+      priority?: number;
+      is_active?: boolean;
+      tags?: string[];
+    }
   ) {
-    return this.fetchApi<{ operation_id: string; message: string }>(
-      `/api/banks/${bankId}/mental-models/refresh`,
-      {
-        method: "POST",
-        body: JSON.stringify(subtype ? { subtype } : {}),
-      }
-    );
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      content: string;
+      priority: number;
+      is_active: boolean;
+      tags: string[];
+      created_at: string;
+      updated_at: string;
+    }>(`/api/banks/${bankId}/directives`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
   }
 
   /**
-   * Delete a mental model
+   * Get a directive
    */
-  async deleteMentalModel(bankId: string, modelId: string) {
-    return this.fetchApi(`/api/banks/${bankId}/mental-models/${modelId}`, {
+  async getDirective(bankId: string, directiveId: string) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      content: string;
+      priority: number;
+      is_active: boolean;
+      tags: string[];
+      created_at: string;
+      updated_at: string;
+    }>(`/api/banks/${bankId}/directives/${directiveId}`);
+  }
+
+  /**
+   * Delete a directive
+   */
+  async deleteDirective(bankId: string, directiveId: string) {
+    return this.fetchApi(`/api/banks/${bankId}/directives/${directiveId}`, {
       method: "DELETE",
+    });
+  }
+
+  /**
+   * Update a directive
+   */
+  async updateDirective(
+    bankId: string,
+    directiveId: string,
+    params: {
+      name?: string;
+      content?: string;
+      priority?: number;
+      is_active?: boolean;
+      tags?: string[];
+    }
+  ) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      content: string;
+      priority: number;
+      is_active: boolean;
+      tags: string[];
+      created_at: string;
+      updated_at: string;
+    }>(`/api/banks/${bankId}/directives/${directiveId}`, {
+      method: "PATCH",
+      body: JSON.stringify(params),
     });
   }
 
@@ -321,47 +450,6 @@ export class ControlPlaneClient {
       completed_at: string | null;
       error_message: string | null;
     }>(`/api/banks/${bankId}/operations/${operationId}`);
-  }
-
-  /**
-   * Generate/refresh content for a specific mental model (async)
-   */
-  async generateMentalModel(bankId: string, modelId: string) {
-    return this.fetchApi<{ operation_id: string; message: string }>(
-      `/api/banks/${bankId}/mental-models/${modelId}/generate`,
-      {
-        method: "POST",
-      }
-    );
-  }
-
-  /**
-   * Create a pinned mental model
-   */
-  async createMentalModel(
-    bankId: string,
-    params: {
-      name: string;
-      description: string;
-      tags?: string[];
-    }
-  ) {
-    return this.fetchApi<{
-      id: string;
-      bank_id: string;
-      subtype: string;
-      name: string;
-      description: string;
-      observations?: Array<{ title: string; text: string; based_on: string[] }>;
-      entity_id: string | null;
-      links: string[];
-      tags?: string[];
-      last_updated: string | null;
-      created_at: string;
-    }>(`/api/banks/${bankId}/mental-models`, {
-      method: "POST",
-      body: JSON.stringify(params),
-    });
   }
 
   /**
@@ -383,6 +471,228 @@ export class ControlPlaneClient {
       method: "PUT",
       body: JSON.stringify(profile),
     });
+  }
+
+  // ============= MENTAL MODELS (auto-consolidated, read-only) =============
+
+  /**
+   * List mental models for a bank (auto-consolidated knowledge)
+   */
+  async listMentalModels(bankId: string, tags?: string[], tagsMatch?: string) {
+    const params = new URLSearchParams();
+    if (tags && tags.length > 0) {
+      tags.forEach((t) => params.append("tags", t));
+    }
+    if (tagsMatch) {
+      params.append("tags_match", tagsMatch);
+    }
+    const query = params.toString();
+    return this.fetchApi<{
+      items: Array<{
+        id: string;
+        bank_id: string;
+        text: string;
+        proof_count: number;
+        history: Array<{
+          previous_text: string;
+          changed_at: string;
+          reason: string;
+        }>;
+        tags: string[];
+        source_memory_ids: string[];
+        source_memories: Array<{
+          id: string;
+          text: string;
+          type: string;
+          context?: string;
+          occurred_start?: string;
+          mentioned_at?: string;
+        }>;
+        created_at: string;
+        updated_at: string;
+      }>;
+    }>(`/api/banks/${bankId}/mental-models${query ? `?${query}` : ""}`);
+  }
+
+  /**
+   * Get a mental model with source memories
+   */
+  async getMentalModel(bankId: string, modelId: string) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      text: string;
+      proof_count: number;
+      history: Array<{
+        previous_text: string;
+        changed_at: string;
+        reason: string;
+      }>;
+      tags: string[];
+      source_memory_ids: string[];
+      source_memories: Array<{
+        id: string;
+        text: string;
+        type: string;
+        context?: string;
+        occurred_start?: string;
+        mentioned_at?: string;
+      }>;
+      created_at: string;
+      updated_at: string;
+    }>(`/api/banks/${bankId}/mental-models/${modelId}`);
+  }
+
+  // ============= REFLECTIONS =============
+
+  /**
+   * List reflections for a bank
+   */
+  async listReflections(bankId: string, tags?: string[], tagsMatch?: string) {
+    const params = new URLSearchParams();
+    if (tags && tags.length > 0) {
+      tags.forEach((t) => params.append("tags", t));
+    }
+    if (tagsMatch) {
+      params.append("tags_match", tagsMatch);
+    }
+    const query = params.toString();
+    return this.fetchApi<{
+      items: Array<{
+        id: string;
+        bank_id: string;
+        name: string;
+        source_query: string;
+        content: string;
+        tags: string[];
+        last_refreshed_at: string;
+        created_at: string;
+        reflect_response?: {
+          text: string;
+          based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
+          mental_models?: Array<{ id: string; text: string }>;
+        };
+      }>;
+    }>(`/api/banks/${bankId}/reflections${query ? `?${query}` : ""}`);
+  }
+
+  /**
+   * Create a reflection (async - content auto-generated in background)
+   * Returns operation_id to track progress
+   */
+  async createReflection(
+    bankId: string,
+    params: {
+      name: string;
+      source_query: string;
+      tags?: string[];
+      max_tokens?: number;
+    }
+  ) {
+    return this.fetchApi<{
+      operation_id: string;
+    }>(`/api/banks/${bankId}/reflections`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Get a reflection
+   */
+  async getReflection(bankId: string, reflectionId: string) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      source_query: string;
+      content: string;
+      tags: string[];
+      last_refreshed_at: string;
+      created_at: string;
+      reflect_response?: {
+        text: string;
+        based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
+        mental_models?: Array<{ id: string; text: string }>;
+      };
+    }>(`/api/banks/${bankId}/reflections/${reflectionId}`);
+  }
+
+  /**
+   * Update a reflection
+   */
+  async updateReflection(
+    bankId: string,
+    reflectionId: string,
+    params: {
+      name?: string;
+    }
+  ) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      source_query: string;
+      content: string;
+      tags: string[];
+      last_refreshed_at: string;
+      created_at: string;
+      reflect_response?: {
+        text: string;
+        based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
+        mental_models?: Array<{ id: string; text: string }>;
+      };
+    }>(`/api/banks/${bankId}/reflections/${reflectionId}`, {
+      method: "PATCH",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Delete a reflection
+   */
+  async deleteReflection(bankId: string, reflectionId: string) {
+    return this.fetchApi(`/api/banks/${bankId}/reflections/${reflectionId}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Refresh a reflection (re-run source query)
+   */
+  async refreshReflection(bankId: string, reflectionId: string) {
+    return this.fetchApi<{
+      id: string;
+      bank_id: string;
+      name: string;
+      source_query: string;
+      content: string;
+      tags: string[];
+      last_refreshed_at: string;
+      created_at: string;
+      reflect_response?: {
+        text: string;
+        based_on: Record<string, Array<{ id: string; text: string; type: string }>>;
+        mental_models?: Array<{ id: string; text: string }>;
+      };
+    }>(`/api/banks/${bankId}/reflections/${reflectionId}/refresh`, {
+      method: "POST",
+    });
+  }
+
+  /**
+   * Get API version and feature flags
+   * Use this to check which capabilities are available in the dataplane
+   */
+  async getVersion() {
+    return this.fetchApi<{
+      api_version: string;
+      features: {
+        mental_models: boolean;
+        mcp: boolean;
+        worker: boolean;
+      };
+    }>("/api/version");
   }
 }
 

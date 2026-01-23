@@ -308,6 +308,19 @@ export class HindsightClient {
 
         return this.validateResponse(response, 'getBankProfile');
     }
+
+    /**
+     * Set or update the mission for a memory bank.
+     */
+    async setMission(bankId: string, mission: string): Promise<BankProfileResponse> {
+        const response = await sdk.createOrUpdateBank({
+            client: this.client,
+            path: { bank_id: bankId },
+            body: { mission },
+        });
+
+        return this.validateResponse(response, 'setMission');
+    }
 }
 
 // Re-export types for convenience
